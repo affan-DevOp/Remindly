@@ -1,6 +1,6 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# Learn more: https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
-# dependencies
+# Dependencies
 node_modules/
 
 # Expo
@@ -9,7 +9,7 @@ dist/
 web-build/
 expo-env.d.ts
 
-# Native
+# Native Builds & Artifacts
 .kotlin/
 *.orig.*
 *.jks
@@ -21,21 +21,38 @@ expo-env.d.ts
 # Metro
 .metro-health-check*
 
-# debug
+# Debug & Logs
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+*.log
 
-# macOS
+# OS & Temp
 .DS_Store
+Thumbs.db
 *.pem
 
-# local env files
-.env*.local
+# Environment & Secrets (Crucial: Prevents credential leakage)
+.env
+.env.*
+!.env.example
 
-# typescript
+# Local Agent & MCP Configs with API Keys
+mcp_config.json
+.agents/mcp_config.json
+
+# Local Databases & Backups
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# TypeScript build info
 *.tsbuildinfo
 
-# generated native folders
+# Generated native build directories
 /ios
 /android
+.agents/
