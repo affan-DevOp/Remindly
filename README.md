@@ -1,187 +1,175 @@
 # Remindly
 
-> **Android-First, Local-First Contextual Reminder Assistant**  
-> *"Never lose a follow-up hidden in a message."*
+An Android-first reminder app that keeps the context behind each commitment. Capture a task in the app, share text from another app, or use a compact shortcut at the screen edge.
 
-[![Expo](https://img.shields.io/badge/Expo-SDK_58-000020.svg?logo=expo)](https://expo.dev)
-[![React Native](https://img.shields.io/badge/React_Native-0.76+-61DAFB.svg?logo=react&logoColor=black)](https://reactnative.dev)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6.svg?logo=typescript)](https://www.typescriptlang.org)
-[![SQLite](https://img.shields.io/badge/SQLite-Local_First-003B57.svg?logo=sqlite)](https://docs.expo.dev/versions/latest/sdk/sqlite/)
-[![Tests](https://img.shields.io/badge/Tests-133_Passing-brightgreen.svg)](#testing--verification)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Expo](https://img.shields.io/badge/Expo-SDK_58-000020?logo=expo)](https://expo.dev)
+[![React Native](https://img.shields.io/badge/React_Native-0.88-61DAFB?logo=react&logoColor=black)](https://reactnative.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6?logo=typescript)](https://www.typescriptlang.org)
+[![Tests](https://img.shields.io/badge/Tests-175_passing-brightgreen)](#testing-and-verification)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
----
+## Features
 
-## Overview
+- **Today, Calendar, and Inbox:** schedule reminders, browse selected dates, search tasks, or save an undated commitment for later.
+- **Contextual capture:** retain shared text, subjects, senders, and source links when available. Date suggestions from natural-language text can be reviewed before saving.
+- **Compact floating shortcut:** a faint 12dp edge tab opens native capture over other apps. Drag it to either side; its side and vertical position are remembered. The full circle appears while dragging, then tucks back into the edge.
+- **Task actions:** edit, reschedule, complete, delete, snooze, and undo supported actions. Rescheduling retains the original context; snoozing preserves the original deadline.
+- **Local notifications:** reminder profiles, quiet hours, sound/vibration controls, lock-screen privacy, and a test alert. Notification buttons provide **Done** and **Snooze 10 min**; actions open the app so its handler can run after a cold start.
+- **Guest and account modes:** use the app without signing in, or authenticate with Google or a verified email code through Clerk. Guest tasks migrate into the account's local collection on sign-in. Switching accounts signs out before starting a new sign-in.
+- **On-device storage:** native SQLite stores tasks, source context, settings, profiles, and reminder occurrences. A fallback store supports recovery; the web fallback uses localStorage.
 
-**Remindly** is an Android-first mobile reminder application engineered with **React Native**, **Expo SDK 58**, and **TypeScript**. 
+Authentication identifies a local task collection. **There is no cloud task-sync backend**, and signing in on another device does not synchronize reminders. Clerk authentication uses network services; local task storage is separate from authentication.
 
-Unlike conventional reminder applications that treat task entry as an empty input box disconnected from context, Remindly connects directly into the mobile workflow:
-- **Share directly from any app** (WhatsApp, Outlook, Gmail, Slack, Telegram, Chrome, Notion, etc.) via Android's native `ACTION_SEND` intent.
-- **On-screen Quick Capture Overlay**: capture and schedule commitments without leaving your active chat or browser.
-- **Local-first SQLite architecture**: your data stays on your device with high-speed indexing, zero tracking, and offline reliability.
-- **Clerk Google & Direct Email Authentication**: multi-user isolation with automatic guest task migration—your reminders are never wiped when logging in.
+## Using the app
 
----
+### Create a reminder
 
-## Key Highlights & Features
+1. Tap **Capture** or the central **+** button.
+2. Enter a title and choose a reminder profile.
+3. Confirm a date/time, or select **Inbox** to save without a deadline.
+4. Tap **Save reminder**. Scheduled items appear under the relevant date; undated items appear in Inbox.
 
-### 1. Tactile Swiss-Utility Design Aesthetic
-- **Atmospheric Visuals**: Smoked charcoal & obsidian canvas (`#16130F`), diffuse radial lighting, and glassmorphic sheets powered by `expo-blur` (`dimezisBlurViewSdk31Plus` on Android).
-- **High-Contrast Input Fields**: Luminous input borders (`rgba(224,243,74,0.35)`) and clear typography (`#F8F5ED`) ensuring field visibility in dark mode.
-- **Organic Earth-Tone Timeline**: Floating reminder cards dynamically alternate botanical tree hues:
-  - 🌱 **Lime Sprout** (`#DDF24B`)
-  - 🍃 **Sage Leaf** (`#DCE7D8`)
-  - 🪵 **Amber Timber** (`#F0E7D6`)
-- **Strict Month Bounding**: Timeline days scroller is strictly bounded to the current viewed month. No dates from adjacent months bleed into the strip.
-- **Past-Date Protection**: Interactive scheduling guards prevent setting reminders in the past while providing friendly feedback.
+Open a reminder to edit it or use its actions. The date/time tiles reopen capture to reschedule the same reminder.
 
-### 2. Multi-User Isolation & Seamless Authentication
-- **Local-First Guest Mode**: Start using the app immediately without signing in.
-- **Google OAuth (Clerk)**: Dedicated `SignInSheet` with seamless Expo web browser integration.
-- **Direct Custom Account / Email Sign-In**: Enter your name and email to create an authenticated profile instantly.
-- **Zero-Loss Data Migration**: On sign-in, existing guest reminders automatically migrate to your user account (`UPDATE tasks SET user_id = ?`).
-- **Non-Disruptive Logout**: Signing out switches back to guest mode inside the app without locking you into an onboarding tour.
+### Share text into Remindly
 
-### 3. Local-First SQLite Persistence with Safe Mode
-- **Versioned SQLite Schema**: Versioned migrations managing `tasks`, `task_sources`, `reminder_profiles`, `profile_stages`, `reminder_occurrences`, and `app_settings`.
-- **Defensive Multi-Tier Storage**:
-  - `openDatabaseAsync` (Primary native driver)
-  - `openDatabaseSync` (Fallback synchronous driver)
-  - Legacy `omniremind.db` database migration
-  - Memory persistence with `expo-secure-store` backing
-  - **Safe Mode recovery screen** in case of catastrophic storage lockouts.
+1. Select text or open a link in an app that supports sharing text.
+2. Choose **Share > Remindly**. Look under **More** if needed.
+3. Review the populated title, source context, and any suggested deadline.
+4. Choose a date/time or **Inbox**, then save.
 
-### 4. Smart Source Auto-Detection
-Intelligently classifies incoming share payloads and typed text from across the Android ecosystem:
-- **WhatsApp**: detects message timestamps (`[12:45, 10/24/2026]`), forwarded headers, and chat links.
-- **Outlook**: detects `com.microsoft.office.outlook`, `@outlook.com`, `@live.com`, and Microsoft Teams.
-- **Gmail**: detects `com.google.android.gm`, `From:`, `Subject:`, and Google Mail headers.
-- **Slack**: detects `slack.com/archives`, `#general`, `@channel`, and `@here`.
-- **Telegram**: detects `t.me` links and `org.telegram.messenger`.
-- **Web**: detects browser callers (Chrome, Firefox, Edge) and standalone URLs.
-- **Notes**: detects markdown lists, checkboxes, and memo headers.
+For example, share `Submit assignment tomorrow at 2 PM` and confirm the suggested date before saving. Android text sharing uses `ACTION_SEND`; available context depends on what the sending app provides. Image/file attachment import is not implemented.
 
-### 5. Advanced Android Notification Engine
-- **Dual Notification Channels**:
-  - `remindly_standard` (Heads-up alerts: `-24h`, `-1h`)
-  - `remindly_urgent` (Deadline & Follow-ups: `-15m`, `Due (0m)`, high-priority vibration pulse)
-- **Quiet Hours Scheduling**: Automatically defers heads-up notifications during configured rest periods (e.g., 22:00 -> 08:00) while ensuring critical deadlines fire on time.
-- **Interactive Action Handling**: Action buttons (`Done`, `Snooze +15m`, `Snooze +1h`) dismiss the notification and update SQLite status without closing or resetting the app.
-- **Fast Test Reminder**: 2-second armed test alert in Settings for rapid hardware verification.
-- **Clean Notification Dot**: Top bar inbox indicator dot is strictly conditioned on pending inbox tasks (`tasks.some(t => t.status === 'inbox')`) and remains hidden when empty.
+### Enable Quick Capture Anywhere
 
----
+1. Open **Settings > Quick Capture Anywhere**.
+2. Tap **Grant Access** if required and allow Remindly to **display over other apps** in Android settings.
+3. Return to Remindly and enable **Floating capture button**.
+4. Open another app and tap the faint edge tab to capture a reminder.
 
-## 4 Built-In Reminder Profiles
+Drag the tab to reposition it. Closing capture returns it to the saved edge position. Use **Stop Service** or turn the switch off to remove it. A persistent Android notification indicates that the capture service is running. Protected system screens may hide overlays.
 
-| Profile | Description | Stages |
-| :--- | :--- | :--- |
-| **Simple** | Minimal reminder for casual to-dos. | Due (`0m`) |
-| **Standard** | Balanced alerts for daily work commitments. | `-24h`, `-1h`, Due (`0m`) |
-| **Important** | High-visibility escalations for strict deadlines. | `-24h`, `-4h`, `-15m`, Due (`0m`) |
-| **Persistent** | Repeated nudges for commitments you cannot afford to miss. | Standard + `+15m`, `+30m`, `+60m` follow-ups |
+This feature requires an Android build containing this project's native code. It is unavailable in Expo Go and the web preview.
 
----
+### Check notifications
 
-## Architecture
+Allow Android notification permission, then use the test-reminder button in Settings. Check the phone's Sound mode and notification volume if an alert arrives silently. Android notification settings and device battery restrictions can also affect delivery.
 
-```
-Remindly/
-├── App.tsx                                  # App entry point, Clerk auth provider & notification listener
-├── app.json                                 # Expo configuration, Android intentFilters & permissions
-├── plugins/
-│   ├── with-quick-capture.js                # Config plugin for native overlay window service
-│   └── with-share-intent.js                 # Config plugin for Android ACTION_SEND intent filter
-├── src/
-│   ├── components/
-│   │   ├── RemindlyDesignReference.tsx      # Main application interface, timeline, quick capture & modals
-│   │   ├── popups/                          # Accessible dialogs, selectors, snackbars & explainers
-│   │   └── ...                              # Visual cards, temporal chips & navigation dock
-│   ├── config/
-│   │   └── clerk.ts                         # Clerk configuration and token cache
-│   ├── db/
-│   │   ├── sqliteDatabase.ts                # Multi-tier SQLite persistence & memory fallback
-│   │   └── migrations.ts                    # Schema v1-v3 migrations with multi-user isolation
-│   ├── domain/
-│   │   ├── nlpParser.ts                     # Chrono-node deterministic date/time parser
-│   │   ├── occurrenceMaterializer.ts        # Dynamic occurrence generation engine
-│   │   └── types.ts                         # Strongly typed domain records
-│   ├── services/
-│   │   ├── notificationService.ts           # Android notification channels & quiet hours scheduler
-│   │   ├── quickCaptureOverlayService.ts    # Cross-app overlay management
-│   │   ├── shareIngestService.ts            # ACTION_SEND normalizer & 15s deduplicator
-│   │   └── taskRepository.ts                # SQLite CRUD, user migration & backup export
-│   └── types/
-│       └── task.ts                          # App state & user profile interfaces
-└── tests/                                   # 13 comprehensive Jest test suites (133 tests)
-```
+## Reminder profiles
 
----
+| Profile | Scheduled stages |
+| --- | --- |
+| Simple | At the deadline |
+| Standard | 24 hours before, 1 hour before, and at the deadline |
+| Important | 24 hours before, 4 hours before, 15 minutes before, and at the deadline |
+| Persistent | Standard stages plus two follow-ups: 15 and 60 minutes after the deadline |
 
-## Getting Started
+The persistent-follow-ups setting controls those extra follow-ups. Explicit snoozes remain independent. Quiet hours defer eligible advance reminders; deadline alerts are exempt.
 
-### Prerequisites
+## Development setup
 
-- **Node.js**: 18.x or newer (tested on Node 20 & 24)
-- **Full test suite**: use Node 24; the native database migration tests use its built-in SQLite engine to enforce real foreign-key constraints.
-- **npm** or **yarn**
-- **Android Device or Emulator** (API 26+) / **Expo Go**
+### Requirements
 
-### Installation
+- **Node.js 24.3+ within the Node 24 release line** and npm. Node 24 was used for verification; migration tests use its built-in SQLite engine. The installed Expo/React Native versions do not support the previously documented Node 18/20 setup.
+- **Android Studio**, its bundled JDK, and the Android SDK/NDK required by the generated project.
+- An Android emulator or a physical device with USB debugging enabled and authorized. Confirm it appears as `device` in `adb devices`.
+- A configured Clerk instance for independent authentication testing.
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/affan-DevOp/Remindly.git
-   cd Remindly
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   npm install --legacy-peer-deps
-   ```
-
-3. **Configure environment variables (Optional)**:
-   ```bash
-   cp .env.example .env
-   ```
-   *(A public Clerk test key is provided by default for testing out of the box).*
-
-4. **Start the development server**:
-   ```bash
-   npm start
-   ```
-
----
-
-## Testing & Verification
-
-Remindly includes a complete test harness with 13 comprehensive test suites covering database migrations, multi-user isolation, NLP date extraction, notification scheduling, and share ingestion:
+### Install and configure
 
 ```bash
-# Run unit & integration test suites
-npm test
+git clone https://github.com/affan-DevOp/Remindly.git
+cd Remindly
+npm ci --legacy-peer-deps
+```
 
-# Run TypeScript strict typecheck
+Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell), then replace the placeholder:
+
+```dotenv
+EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
+```
+
+Use a **publishable** key, never a Clerk secret key. The source includes a development fallback key for the existing test instance; set your own key for an independent setup. Configure Google OAuth and email-code authentication in that instance as needed. The native callback uses the `remindly` scheme and `oauth-native-callback` path. Keep `.env` out of Git.
+
+Dependency installation runs `scripts/patch-expo-modules.js`. It keeps the targeted notification compatibility shim and preserves normal required/optional native-module detection; fake native-module proxies break font and asset loading.
+
+### Run on Android
+
+```bash
+npm run android
+```
+
+This generates the Android project when absent, applies the config plugins, builds the native app, and starts the development workflow. Native sharing and floating capture require this build. After changing Kotlin code or native configuration, rebuild the app.
+
+For an already installed debug build, start Metro with `npm start`. USB forwarding can be configured with:
+
+```bash
+adb reverse tcp:8081 tcp:8081
+```
+
+If Metro binds only to IPv6 on Windows, the verified PowerShell startup was:
+
+```powershell
+$env:NODE_OPTIONS='--dns-result-order=ipv4first'
+npx expo start --localhost --port 8081
+```
+
+A debug build needs Metro. A standalone build bundles JavaScript and assets and runs without it. After generating `android/`, an arm64 standalone test build can be created from that directory with:
+
+```powershell
+.\gradlew.bat :app:assembleRelease -PreactNativeArchitectures=arm64-v8a
+```
+
+Output: `android/app/build/outputs/apk/release/app-release.apk`. Choose an architecture appropriate to your device. The generated project's current release configuration uses its debug signing key for local testing; configure your own release signing before publishing.
+
+Long Windows/OneDrive paths may exceed CMake/Ninja limits. The tested short-drive build workaround is recorded in the [functional audit](docs/FUNCTIONAL_AUDIT.md#windows-build-notes). Generated Android/iOS projects, APKs, local databases, logs, and device screenshots are not committed.
+
+### Web preview
+
+```bash
+npm run web
+```
+
+The web preview uses localStorage fallback persistence. Native notifications and floating capture are unavailable. iOS has not been verified on hardware.
+
+## Project structure
+
+| Path | Purpose |
+| --- | --- |
+| `App.tsx` | Startup, fonts, Clerk, lifecycle refresh, share links, and notification responses |
+| `src/components/RemindlyDesignReference.tsx` | Active interface, capture sheets, calendar, task actions, and settings |
+| `src/db/` | Native/web database drivers, fallback storage, and schema migrations |
+| `src/domain/` | Reminder profiles, date parsing, and occurrence materialization |
+| `src/services/` | Task repository, notification scheduling, share normalization, and overlay bridge |
+| `src/utils/captureScheduling.ts` | Capture date/time defaults and rollover handling |
+| `plugins/with-share-intent.js` | Routes native Android text shares into the app |
+| `plugins/with-quick-capture.js` | Registers native capture components and copies Kotlin sources during prebuild |
+| `plugins/quick-capture/` | Version-controlled overlay views/service, database helper, and alarm receiver |
+| `scripts/patch-expo-modules.js` | Targeted dependency compatibility patch applied after installation |
+| `tests/` | Jest regression, component, repository, migration, and scheduling tests |
+| `docs/FUNCTIONAL_AUDIT.md` | Repairs, validation evidence, device checks, and remaining limits |
+
+The primary interface is mounted from `RemindlyDesignReference.tsx`; the other standalone screen files are not the app's main navigation implementation.
+
+## Testing and verification
+
+```bash
+npm test -- --silent
 npm run typecheck
 ```
 
-**Test Suite Breakdown (133 / 133 Passing)**:
-- `tests/login_and_features_checkup.test.ts`: User login, guest task migration, non-disruptive logout, and ecosystem source detection.
-- `tests/phase1.test.ts`: Component baseline & temporal chips.
-- `tests/phase2_repository.test.ts`: SQLite migrations, occurrence materialization & profile stages.
-- `tests/phase3_notifications.test.ts`: Android channels, quiet hours & idempotency.
-- `tests/phase3_final_notifications.test.ts`: Budget cap & multi-stage notification dispatch.
-- `tests/phase4_share.test.ts`: `ACTION_SEND` normalization & URL extraction.
-- `tests/phase5_nlp.test.ts`: Deterministic NLP parsing across 11+ natural language date formats.
-- `tests/phase6_lifecycle.test.ts`: Full task lifecycle (create, schedule, snooze, complete, undo).
-- `tests/phase7_stress_and_privacy.test.ts`: 50-task load test & zero-exfiltration privacy audit.
-- `tests/phase8_popup_system.test.ts`: Accessible dialogs & contextual sheets.
-- `tests/phase9_quick_capture_anywhere.test.ts`: Native Android floating overlay integration.
-- `tests/services.test.ts` & `tests/baseline.test.ts`: Service singletons & token contracts.
+Latest verification on **27 October 2026**:
 
----
+- **175 tests across 17 suites passed**, including actual interface handlers, persistence failures, account switching, date rollover, share ingestion, notification scheduling, and real SQLite foreign-key migration checks.
+- TypeScript checks and web export passed.
+- Android debug and standalone release APK builds passed for arm64-v8a.
+- On a **Vivo V50e running Android 16**, tested capture, editing, completion/Undo, calendar rescheduling, deletion, persistence through restart, sharing, Google sign-in, sound/vibration, and cold-start notification Snooze.
+- The compact overlay was separately tested over Chrome: open/close, dragging to both edges, and retaining position when capture closes.
+
+Clerk is mocked in component tests; live Google sign-in was also checked on the phone. Email-code delivery, reboot recovery, permission revocation/regrant, long-running battery restrictions, every sending app's sharing behavior, and all notification actions in every lifecycle state remain unverified on hardware. Automated tests do not establish universal device compatibility.
+
+See the [functional audit](docs/FUNCTIONAL_AUDIT.md) for the detailed findings and limitations.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+[MIT](LICENSE).
