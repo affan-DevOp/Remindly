@@ -141,32 +141,6 @@ export async function runMigrations(db: ISqliteDatabase): Promise<void> {
     });
   }
 
-  if (currentVersion < 3) {
-    await db.transaction(async (tx) => {
-      // Refresh builtin_persistent stages to exactly 2 bounded follow-ups (+15m and +60m)
-      const persistentDef = BUILTIN_PROFILES.find((p) => p.id === 'builtin_persistent');
-      if (persistentDef) {
-        await tx.run('DELETE FROM profile_stages WHERE profile_id = ?;', [persistentDef.id]);
-        await tx.run(
-          'UPDATE reminder_profiles SET description = ?, max_repeats = ? WHERE id = ?;',
-          [persistentDef.description, persistentDef.max_repeats, persistentDef.id]
-        );
-        for (const stage of persistentDef.stages) {
-          const stageId = `stage-${persistentDef.id}-${stage.sort_order}`;
-          await tx.run(
-            'INSERT INTO profile_stages (id, profile_id, sort_order, offset_minutes, stage_kind, enabled) VALUES (?, ?, ?, ?, ?, 1);',
-            [stageId, persistentDef.id, stage.sort_order, stage.offset_minutes, stage.stage_kind]
-          );
-        }
-      }
-
-      await tx.run(
-        'INSERT INTO schema_migrations (version, applied_at_utc) VALUES (?, ?);',
-        [3, new Date().toISOString()]
-      );
-    });
-  }
-
   for (const def of BUILTIN_PROFILES) {
     const existing = await db.getFirst(
       'SELECT id FROM reminder_profiles WHERE id = ?;',
@@ -188,6 +162,32 @@ export async function runMigrations(db: ISqliteDatabase): Promise<void> {
         );
       }
     }
+  }
+
+  if (currentVersion < 3) {
+    await db.transaction(async (tx) => {
+      // Refresh builtin_persistent stages to exactly 2 bounded follow-ups (+15m and +60m)
+      const persistentDef = BUILTIN_PROFILES.find((p) => p.id === 'builtin_persistent');
+      if (persistentDef) {
+        await tx.run('UPDATE profile_stages SET enabled = 0 WHERE profile_id = ?;', [persistentDef.id]);
+        await tx.run(
+          'UPDATE reminder_profiles SET description = ?, max_repeats = ? WHERE id = ?;',
+          [persistentDef.description, persistentDef.max_repeats, persistentDef.id]
+        );
+        for (const stage of persistentDef.stages) {
+          const stageId = `stage-${persistentDef.id}-${stage.sort_order}`;
+          await tx.run(
+            `INSERT INTO profile_stages (id, profile_id, sort_order, offset_minutes, stage_kind, enabled) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(id) DO UPDATE SET sort_order = excluded.sort_order, offset_minutes = excluded.offset_minutes, stage_kind = excluded.stage_kind, enabled = 1;`,
+            [stageId, persistentDef.id, stage.sort_order, stage.offset_minutes, stage.stage_kind]
+          );
+        }
+      }
+
+      await tx.run(
+        'INSERT INTO schema_migrations (version, applied_at_utc) VALUES (?, ?);',
+        [3, new Date().toISOString()]
+      );
+    });
   }
 
   const defaultSettings: Record<string, string> = {

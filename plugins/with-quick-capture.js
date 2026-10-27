@@ -1,4 +1,6 @@
-const { withAndroidManifest, withMainApplication } = require('@expo/config-plugins');
+const { withAndroidManifest, withMainApplication, withDangerousMod } = require('@expo/config-plugins');
+const fs = require('fs');
+const path = require('path');
 
 function withQuickCapture(config) {
   // 1. Manifest additions
@@ -68,6 +70,16 @@ function withQuickCapture(config) {
     return config;
   });
 
+  // Keep the native implementation in source control and restore it on prebuild.
+  config = withDangerousMod(config, ['android', async (mod) => {
+    const source = path.join(__dirname, 'quick-capture');
+    const destination = path.join(mod.modRequest.platformProjectRoot, 'app/src/main/java/com/remindly/app/overlay');
+    fs.mkdirSync(destination, { recursive: true });
+    for (const file of fs.readdirSync(source).filter((name) => name.endsWith('.kt'))) {
+      fs.copyFileSync(path.join(source, file), path.join(destination, file));
+    }
+    return mod;
+  }]);
   return config;
 }
 

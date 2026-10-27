@@ -65,7 +65,7 @@ export function adjustForQuietHours(
   deferred.setHours(config.endHour, config.endMinute, 0, 0);
 
   // If trigger was late evening before midnight, deferral is next day morning
-  if (triggerDate.getHours() >= config.startHour) {
+  if (deferred.getTime() <= triggerDate.getTime()) {
     deferred.setDate(deferred.getDate() + 1);
   }
 
@@ -82,6 +82,7 @@ export class NotificationService {
   private categoriesConfigured = false;
   // Mock registry for non-native / test environments
   private mockScheduled = new Map<string, any>();
+  private reconciliationQueue: Promise<unknown> = Promise.resolve();
 
   public async configureChannels(): Promise<void> {
     if (this.channelsConfigured && this.categoriesConfigured) return;
@@ -93,7 +94,6 @@ export class NotificationService {
           name: 'Standard Reminders',
           description: 'Notifications for upcoming reminders and standard follow-ups',
           importance: Notifications.AndroidImportance.HIGH,
-          sound: 'default',
           vibrationPattern: [0, 160],
           lightColor: '#38BDF8',
           enableLights: true,
@@ -105,12 +105,24 @@ export class NotificationService {
           name: 'Important Deadline Alerts',
           description: 'Distinctive two-pulse vibration alerts for important task deadlines',
           importance: Notifications.AndroidImportance.MAX,
-          sound: 'default',
           vibrationPattern: [0, 120, 100, 180],
           lightColor: '#FF6B4A',
           enableLights: true,
           enableVibrate: true,
         });
+        // Android channel sound and vibration are immutable once created.
+        // Separate channels make the in-app switches effective on Android 8+.
+        for (const base of [CHANNEL_STANDARD, CHANNEL_URGENT]) {
+          for (const [sound, vibration] of [[false, true], [true, false], [false, false]]) {
+            await Notifications.setNotificationChannelAsync(this.channelId(base, sound, vibration), {
+              name: `${base === CHANNEL_URGENT ? 'Important' : 'Standard'} Reminders${sound ? '' : ' (silent)'}${vibration ? '' : ' (no vibration)'}`,
+              importance: base === CHANNEL_URGENT ? Notifications.AndroidImportance.MAX : Notifications.AndroidImportance.HIGH,
+              ...(sound ? {} : { sound: null }),
+              enableVibrate: vibration,
+              vibrationPattern: vibration ? (base === CHANNEL_URGENT ? [0, 120, 100, 180] : [0, 160]) : [0],
+            });
+          }
+        }
         this.channelsConfigured = true;
       } catch (e) {
         console.warn('[NotificationService] Failed setting native notification channels:', e);
@@ -125,12 +137,14 @@ export class NotificationService {
           {
             identifier: ACTION_DONE,
             buttonTitle: 'Done',
-            options: { opensAppToForeground: false },
+            // Actions are handled by App's response listener. Starting the app
+            // also delivers them when there is no running JavaScript instance.
+            options: { opensAppToForeground: true },
           },
           {
             identifier: ACTION_SNOOZE_10,
             buttonTitle: 'Snooze 10 min',
-            options: { opensAppToForeground: false },
+            options: { opensAppToForeground: true },
           },
         ]);
         this.categoriesConfigured = true;
@@ -154,6 +168,10 @@ export class NotificationService {
     return false;
   }
 
+  private channelId(base: string, sound: boolean, vibration: boolean): string {
+    return `${base}${sound ? '' : '_silent'}${vibration ? '' : '_no_vibration'}`;
+  }
+
   public async requestPermissions(): Promise<boolean> {
     try {
       if (typeof Notifications.requestPermissionsAsync === 'function') {
@@ -172,7 +190,13 @@ export class NotificationService {
     return false;
   }
 
-  public async reconcileNotifications(now: Date = new Date()): Promise<{
+  public reconcileNotifications(now: Date = new Date()) {
+    const operation = this.reconciliationQueue.then(() => this.reconcileNow(now));
+    this.reconciliationQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  private async reconcileNow(now: Date): Promise<{
     scheduledCount: number;
     cancelledCount: number;
     pendingCount: number;
@@ -215,7 +239,7 @@ export class NotificationService {
       // Check if persistent follow-ups are disabled by user preference
       if (
         settings.persistentFollowupsEnabled === false &&
-        occ.stage_label.includes('+')
+        occ.stage_label.startsWith('+')
       ) {
         continue;
       }
@@ -285,13 +309,10 @@ export class NotificationService {
     for (const item of toSchedule) {
       const { occ, task, effectiveTrigger, isImportantDeadline } = item;
 
-      // Idempotent: already registered in OS, skip!
-      if (osScheduledMap.has(occ.id)) {
-        continue;
-      }
-
       // Android channel selection: distinctive 2-pulse channel for important deadlines, normal channel otherwise
-      const channelId = isImportantDeadline ? CHANNEL_URGENT : CHANNEL_STANDARD;
+      const playSound = settings.notificationsSoundEnabled !== false;
+      const vibrate = settings.notificationsVibrationEnabled !== false;
+      const channelId = this.channelId(isImportantDeadline ? CHANNEL_URGENT : CHANNEL_STANDARD, playSound, vibrate);
       const notifId = `notif-${occ.id}`;
 
       // Respect Lock-Screen Privacy and Sound preferences
@@ -303,7 +324,14 @@ export class NotificationService {
         ? 'You have a scheduled commitment.'
         : `Reminder (${occ.stage_label}): ${task.notes || task.title}`;
 
-      const playSound = settings.notificationsSoundEnabled !== false;
+      const scheduleKey = JSON.stringify([effectiveTrigger.toISOString(), notifTitle, notifBody, channelId]);
+      const existing = osScheduledMap.get(occ.id);
+      if (existing?.content?.data?.scheduleKey === scheduleKey) continue;
+      if (existing) {
+        await Notifications.cancelScheduledNotificationAsync(existing.identifier);
+        this.mockScheduled.delete(existing.identifier);
+        cancelledCount++;
+      }
 
       try {
         if (typeof Notifications.scheduleNotificationAsync === 'function') {
@@ -316,10 +344,11 @@ export class NotificationService {
                 taskId: task.id,
                 occurrenceId: occ.id,
                 stage: occ.stage_label,
+                scheduleKey,
               },
               sound: playSound,
               categoryIdentifier: CATEGORY_TASK_REMINDER,
-              ...(Platform.OS === 'android' ? { channelId } : {}),
+              vibrate: vibrate ? (isImportantDeadline ? [0, 120, 100, 180] : [0, 160]) : [0],
             },
             trigger: (() => {
               const diffSec = Math.max(1, Math.round((effectiveTrigger.getTime() - Date.now()) / 1000));
@@ -327,11 +356,13 @@ export class NotificationService {
                 return {
                   type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
                   seconds: diffSec,
+                  ...(Platform.OS === 'android' ? { channelId } : {}),
                 };
               }
               return {
                 type: Notifications.SchedulableTriggerInputTypes.DATE,
                 date: effectiveTrigger,
+                ...(Platform.OS === 'android' ? { channelId } : {}),
               };
             })(),
           });
@@ -341,7 +372,7 @@ export class NotificationService {
           content: {
             title: notifTitle,
             body: notifBody,
-            data: { taskId: task.id, occurrenceId: occ.id, stage: occ.stage_label },
+            data: { taskId: task.id, occurrenceId: occ.id, stage: occ.stage_label, scheduleKey },
           },
         });
 
@@ -357,7 +388,7 @@ export class NotificationService {
     for (const item of osScheduled) {
       const taskId = item.content?.data?.taskId;
       const occId = item.content?.data?.occurrenceId;
-      if (taskId) {
+      if (taskId && !item.content?.data?.test) {
         const task = taskMap.get(taskId);
         const shouldCancel =
           !task ||
@@ -466,11 +497,11 @@ export class NotificationService {
             color: '#38BDF8',
             data: { test: true, taskId: id },
             categoryIdentifier: CATEGORY_TASK_REMINDER,
-            ...(Platform.OS === 'android' ? { channelId: CHANNEL_URGENT } : {}),
           },
           trigger: {
             type: (Notifications.SchedulableTriggerInputTypes?.TIME_INTERVAL || 'timeInterval') as any,
             seconds: 2,
+            ...(Platform.OS === 'android' ? { channelId: this.channelId(CHANNEL_URGENT, playSound, settings.notificationsVibrationEnabled !== false) } : {}),
           },
         });
       }

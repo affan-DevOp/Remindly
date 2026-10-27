@@ -38,8 +38,7 @@ export class NotificationService {
   }
 
   public async sendTestNotification(): Promise<string | null> {
-    console.log('[NotificationService Web] Sent test notification');
-    return 'web-test-reminder';
+    return null;
   }
 }
 

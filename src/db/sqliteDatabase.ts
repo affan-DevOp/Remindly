@@ -1,5 +1,5 @@
 ﻿import { Platform } from 'react-native';
-import * as SQLite from 'expo-sqlite';
+import * as SQLite from './sqliteDriver';
 let SecureStore: any = null;
 try {
   SecureStore = require('expo-secure-store');
@@ -27,6 +27,8 @@ export interface ISqliteDatabase {
 }
 
 export class MemorySqliteDatabase implements ISqliteDatabase {
+  private transactionQueue: Promise<unknown> = Promise.resolve();
+  private inTransaction = false;
   private tables: Record<string, any[]> = {
     tasks: [],
     task_sources: [],
@@ -39,8 +41,10 @@ export class MemorySqliteDatabase implements ISqliteDatabase {
 
   public async initPersistence(): Promise<void> {
     try {
-      if (typeof SecureStore.getItemAsync === 'function') {
-        const raw = await SecureStore.getItemAsync('remindly_in_memory_backup');
+      if (Platform.OS === 'web' || typeof SecureStore?.getItemAsync === 'function') {
+        const raw = Platform.OS === 'web'
+          ? globalThis.localStorage?.getItem('remindly_in_memory_backup')
+          : await SecureStore.getItemAsync('remindly_in_memory_backup');
         if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed && typeof parsed === 'object') {
@@ -58,17 +62,20 @@ export class MemorySqliteDatabase implements ISqliteDatabase {
   }
 
   public async persistAsync(): Promise<void> {
+    if (this.inTransaction) return;
     try {
-      if (typeof SecureStore.setItemAsync === 'function') {
+      if (Platform.OS === 'web' || typeof SecureStore?.setItemAsync === 'function') {
         const dataToSave = {
           tasks: this.tables.tasks,
           app_settings: this.tables.app_settings,
           task_sources: this.tables.task_sources,
           reminder_profiles: this.tables.reminder_profiles,
           profile_stages: this.tables.profile_stages,
+          reminder_occurrences: this.tables.reminder_occurrences,
           schema_migrations: this.tables.schema_migrations,
         };
-        await SecureStore.setItemAsync('remindly_in_memory_backup', JSON.stringify(dataToSave));
+        if (Platform.OS === 'web') globalThis.localStorage?.setItem('remindly_in_memory_backup', JSON.stringify(dataToSave));
+        else await SecureStore.setItemAsync('remindly_in_memory_backup', JSON.stringify(dataToSave));
       }
     } catch (e) {
       // Non-fatal
@@ -332,6 +339,11 @@ export class MemorySqliteDatabase implements ISqliteDatabase {
             this.persistAsync().catch(() => {});
             return { rowsAffected: affected };
           }
+        } else if (tableName === 'profile_stages' && lower.includes('enabled = 0')) {
+          const stages = this.tables.profile_stages.filter((stage) => stage.profile_id === params[0]);
+          stages.forEach((stage) => { stage.enabled = 0; });
+          await this.persistAsync();
+          return { rowsAffected: stages.length };
         } else if (tableName === 'reminder_occurrences' && lower.includes('update reminder_occurrences set')) {
           if (lower.includes("status = 'cancelled'")) {
             const isSnoozeOnly = lower.includes("stage_label like 'snooze%'");
@@ -384,7 +396,21 @@ export class MemorySqliteDatabase implements ISqliteDatabase {
   }
 
   async transaction<T>(action: (db: ISqliteDatabase) => Promise<T>): Promise<T> {
-    return action(this);
+    const operation = this.transactionQueue.then(async () => {
+      const snapshot = JSON.parse(JSON.stringify(this.tables));
+      this.inTransaction = true;
+      try {
+        return await action(this);
+      } catch (error) {
+        this.tables = snapshot;
+        throw error;
+      } finally {
+        this.inTransaction = false;
+        await this.persistAsync();
+      }
+    });
+    this.transactionQueue = operation.catch(() => {});
+    return operation;
   }
 }
 

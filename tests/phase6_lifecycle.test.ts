@@ -69,7 +69,7 @@ describe('Phase 6 — End-to-End Task Lifecycle, Profile Studio & Actions', () =
     const snoozeNow = new Date('2026-10-25T15:00:00.000Z'); // at due time
     await taskRepository.snoozeTask(taskId, 15, snoozeNow);
     const snoozedTask = await taskRepository.getDomainTask(taskId);
-    expect(snoozedTask?.due_local_time).toBe('In 15 min');
+    expect(snoozedTask?.due_local_time).toBe('15:00');
 
     // Occurrences should be rescheduled
     const snoozedOccurrences = await taskRepository.getOccurrencesForTask(taskId);

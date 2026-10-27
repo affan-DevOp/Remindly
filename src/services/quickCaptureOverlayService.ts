@@ -13,7 +13,7 @@ export class QuickCaptureOverlayService {
    * Quick Capture Anywhere relies on native Android WindowManager TYPE_APPLICATION_OVERLAY.
    */
   public isSupported(): boolean {
-    return Platform.OS === 'android';
+    return Platform.OS === 'android' && typeof RemindlyQuickCapture?.startOverlayService === 'function';
   }
 
   /**

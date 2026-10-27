@@ -75,6 +75,7 @@ export function isTaskOnSelectedDate(
   if (task.status === 'inbox' || task.dateLabel === 'Inbox') {
     return false;
   }
+  if (isSelectedToday && task.status === 'overdue') return true;
 
   // 1. Explicit dueLocalDate
   if (task.dueLocalDate) {
@@ -104,8 +105,8 @@ export function isTaskOnSelectedDate(
 
   // Custom date string check e.g. "Mon, Oct 26" or "Oct 26"
   const monthShort = selectedDate.toLocaleDateString(undefined, { month: 'short' }).toLowerCase();
-  const dayStr = String(selectedDay);
-  if (dl.includes(monthShort) && dl.includes(dayStr)) {
+  const dayPattern = new RegExp(`\\b${selectedDay}\\b`);
+  if (dl.includes(monthShort) && dayPattern.test(dl)) {
     return true;
   }
 

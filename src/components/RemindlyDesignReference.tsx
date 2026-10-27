@@ -1,4 +1,6 @@
 import { getTimeSortValue, isTaskOnSelectedDate, formatTimeLabel } from '../utils/taskScheduling';
+import { captureDateSelection, captureDeadline, futureCaptureTime, CaptureDateMode } from '../utils/captureScheduling';
+import { parseCaptureText } from '../domain/nlpParser';
 /**
  * RemindlyDesignReference.tsx
  * Refined final visual and interaction reference for Remindly (Expo / React Native)
@@ -17,6 +19,8 @@ import { getTimeSortValue, isTaskOnSelectedDate, formatTimeLabel } from '../util
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
+  Alert,
   BackHandler,
   KeyboardAvoidingView,
   Modal,
@@ -54,7 +58,7 @@ import {
   FeedbackSnackbar,
   PermissionExplainerSheet,
 } from './popups';
-import { useOAuth } from '@clerk/clerk-expo';
+import { useOAuth, useSignIn, useSignUp } from '@clerk/clerk-expo';
 import * as WebBrowser from 'expo-web-browser';
 import * as AuthSession from 'expo-auth-session';
 import Constants, { ExecutionEnvironment } from 'expo-constants';
@@ -208,9 +212,11 @@ export type Props = {
   initialSettings?: any;
   notificationsAllowed?: boolean;
   /** Called when user completes Google or guest sign-in */
-  onUserLogin?: (user: UserProfile) => void;
+  onUserLogin?: (user: UserProfile) => void | Promise<void>;
   /** Called when user logs out */
-  onUserLogout?: () => void;
+  onUserLogout?: () => void | Promise<void>;
+  onOnboardingDismissed?: () => void | Promise<void>;
+  onQuickCaptureAnywhereChange?: (enabled: boolean) => void | Promise<void>;
   /** Wire this to the real local repository and notification scheduler. */
   onCaptureSaved?: (task: OmniTask) => void | Promise<any>;
   /** Wire this to the existing task completion service. */
@@ -335,6 +341,7 @@ export default function RemindlyDesignReference(props: Props) {
   );
 
   const [user, setUser] = useState<UserProfile>(props.currentUser || DEFAULT_USER);
+  const switchingAccount = useRef(false);
 
   useEffect(() => {
     if (props.currentUser) {
@@ -342,15 +349,33 @@ export default function RemindlyDesignReference(props: Props) {
     }
   }, [props.currentUser]);
 
-  const handleUserLogin = (newUser: UserProfile) => {
+  const handleUserLogin = async (newUser: UserProfile) => {
+    await props.onUserLogin?.(newUser);
     setUser(newUser);
-    props.onUserLogin?.(newUser);
   };
 
-  const handleUserLogout = () => {
-    setUser(DEFAULT_USER);
-    props.onUserLogout?.();
-    setOverlay('onboarding');
+  const handleUserLogout = async () => {
+    try {
+      await props.onUserLogout?.();
+      setUser({ ...DEFAULT_USER });
+      setOverlay(null);
+    } catch {
+      showSnackbar('Could not sign out. Please try again.', { icon: 'info' });
+    }
+  };
+
+  const handleAccountSwitch = async () => {
+    if (switchingAccount.current) return;
+    switchingAccount.current = true;
+    try {
+      if (user.isLoggedIn) {
+        await props.onUserLogout?.();
+        setUser({ ...DEFAULT_USER });
+      }
+      setOverlay('sign_in');
+    } catch {
+      showSnackbar('Could not switch accounts. Please try again.', { icon: 'info' });
+    } finally { switchingAccount.current = false; }
   };
 
   const [fontsLoaded] = useFonts({
@@ -363,7 +388,7 @@ export default function RemindlyDesignReference(props: Props) {
   const blurTargetRef = useRef<any>(null);
   const [tab, setTab] = useState<TabKey>('today');
   const [tasks, setTasks] = useState<OmniTask[]>(
-    props.initialTasks && props.initialTasks.length > 0 ? props.initialTasks : seedTasks
+    props.initialTasks ?? seedTasks
   );
   const [overlay, setOverlay] = useState<OverlayKey>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string>('task-101');
@@ -379,7 +404,12 @@ export default function RemindlyDesignReference(props: Props) {
   const [lockScreenPrivacy, setLockScreenPrivacy] = useState(props.initialSettings?.lockScreenPrivacy ?? false);
   const [testSent, setTestSent] = useState(false);
   const [toast, setToast] = useState('');
-  const [initialCaptureConsumed, setInitialCaptureConsumed] = useState(false);
+  const [sharedCapture, setSharedCapture] = useState(false);
+  const [captureRevision, setCaptureRevision] = useState(0);
+  const [editingCaptureTask, setEditingCaptureTask] = useState<OmniTask | undefined>();
+  const [overlayPermissionGranted, setOverlayPermissionGranted] = useState(false);
+  const [quickCaptureAnywhere, setQuickCaptureAnywhere] = useState(false);
+  const mutationInFlight = useRef(false);
 
   // Android Popup & Overlay Design System State
   const [confirmationConfig, setConfirmationConfig] = useState<ConfirmationConfig | null>(null);
@@ -423,7 +453,7 @@ export default function RemindlyDesignReference(props: Props) {
   }, [props.initialSettings]);
 
   useEffect(() => {
-    if (props.initialTasks && props.initialTasks.length > 0) {
+    if (props.initialTasks !== undefined) {
       setTasks(props.initialTasks);
     }
   }, [props.initialTasks]);
@@ -434,14 +464,16 @@ export default function RemindlyDesignReference(props: Props) {
   }, [props.initialView]);
 
   useEffect(() => {
-    if (props.initialSharedText && !initialCaptureConsumed) {
+    if (props.initialSharedText) {
+      setEditingCaptureTask(undefined);
+      setSharedCapture(true);
+      setCaptureRevision((revision) => revision + 1);
       setOverlay('quick');
-      setInitialCaptureConsumed(true);
     }
-  }, [props.initialSharedText, initialCaptureConsumed]);
+  }, [props.initialSharedText, props.initialShareRevision]);
 
   const selectedTask = useMemo(
-    () => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0],
+    () => tasks.find((task) => task.id === selectedTaskId),
     [tasks, selectedTaskId],
   );
 
@@ -450,8 +482,8 @@ export default function RemindlyDesignReference(props: Props) {
     if (tab === 'inbox') result = result.filter((task) => task.status === 'inbox');
     else if (tab === 'today') result = result.filter((task) => task.status !== 'inbox' && task.status !== 'done');
     else if (tab === 'activity') result = result.filter((task) => task.status === 'done' || task.status === 'overdue');
-    if (filter === 'important') result = result.filter((task) => task.important || task.profile === 'Important' || task.profile === 'Persistent');
-    if (filter === 'notes') result = result.filter((task) => task.source === 'Notes' || task.source === 'Manual');
+    if (tab === 'today' && filter === 'important') result = result.filter((task) => task.important || task.profile === 'Important' || task.profile === 'Persistent');
+    if (tab === 'today' && filter === 'notes') result = result.filter((task) => task.source === 'Notes' || task.source === 'Manual');
     if (searchTerm.trim()) {
       const needle = searchTerm.toLowerCase();
       result = result.filter((task) => `${task.title} ${task.excerpt} ${task.source}`.toLowerCase().includes(needle));
@@ -465,6 +497,44 @@ export default function RemindlyDesignReference(props: Props) {
     },
     [showSnackbar]
   );
+
+  useEffect(() => {
+    const refreshOverlay = async () => {
+      setOverlayPermissionGranted(await quickCaptureOverlayService.canDrawOverlays());
+      setQuickCaptureAnywhere(await quickCaptureOverlayService.isOverlayServiceRunning());
+    };
+    void refreshOverlay();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void refreshOverlay();
+    });
+    return () => subscription.remove();
+  }, []);
+
+  const toggleOverlay = async (enabled: boolean) => {
+    if (!quickCaptureOverlayService.isSupported()) {
+      notify('Floating capture requires an Android development build.');
+      return;
+    }
+    if (enabled && !(await quickCaptureOverlayService.canDrawOverlays())) {
+      notify('Grant display over other apps access, then enable floating capture.');
+      await quickCaptureOverlayService.openOverlaySettings();
+      return;
+    }
+    const ok = enabled ? await quickCaptureOverlayService.startOverlayService() : await quickCaptureOverlayService.stopOverlayService();
+    if (!ok) { notify('Could not change floating capture. Please try again.'); return; }
+    setQuickCaptureAnywhere(enabled);
+    try { await props.onQuickCaptureAnywhereChange?.(enabled); }
+    catch { notify('Floating capture changed, but the preference could not be saved.'); }
+  };
+
+  // Await persistence before showing success or exposing Undo; serialize double taps.
+  const runMutation = async (action: () => Promise<void>) => {
+    if (mutationInFlight.current) return;
+    mutationInFlight.current = true;
+    try { await action(); }
+    catch { showSnackbar('Could not save changes. Please try again.', { icon: 'info' }); }
+    finally { mutationInFlight.current = false; }
+  };
 
   const handleCloseQuickCapture = useCallback(() => {
     if (quickCaptureIsDirtyRef.current) {
@@ -509,89 +579,61 @@ export default function RemindlyDesignReference(props: Props) {
     []
   );
 
-  const completeTask = useCallback(
-    (task: OmniTask) => {
-      setTasks((current) => current.map((item) => (item.id === task.id ? { ...item, status: 'done' } : item)));
-      props.onTaskCompleted?.(task.id);
-      setOverlay(null);
-      showSnackbar('Reminder completed', {
-        icon: 'check',
-        actionLabel: 'Undo',
-        onAction: () => {
-          const restored: OmniTask = { ...task, status: 'upcoming' };
-          setTasks((current) => current.map((item) => (item.id === task.id ? restored : item)));
-          if (props.onTaskRestored) props.onTaskRestored(restored);
-          else props.onCaptureSaved?.(restored);
-          showSnackbar('Reminder restored', { icon: 'check' });
-        },
-      });
-    },
-    [showSnackbar, props]
-  );
+  const completeTask = (task: OmniTask) => runMutation(async () => {
+    await props.onTaskCompleted?.(task.id);
+    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: 'done', completedAt: Date.now() } : item));
+    setOverlay(null);
+    showSnackbar('Reminder completed', {
+      actionLabel: 'Undo',
+      onAction: () => { void runMutation(async () => {
+        if (props.onTaskRestored) await props.onTaskRestored(task);
+        else await props.onCaptureSaved?.(task);
+        setTasks((current) => current.map((item) => item.id === task.id ? task : item));
+        showSnackbar('Reminder restored');
+      }); },
+    });
+  });
 
-  const snoozeTask = useCallback(
-    (task: OmniTask, minutes: number) => {
-      const prevTimeLabel = task.timeLabel;
-      const prevStatus = task.status;
-      props.onTaskSnoozed?.(task.id, minutes);
-      setTasks((current) =>
-        current.map((item) =>
-          item.id === task.id
-            ? { ...item, timeLabel: minutes === 60 ? 'In 1 hour' : `In ${minutes} min`, status: 'upcoming' }
-            : item
-        )
-      );
-      setOverlay(null);
-      showSnackbar(`Reminder snoozed for ${minutes === 60 ? '1 hour' : `${minutes} min`}`, {
-        icon: 'clock',
-        actionLabel: 'Undo',
-        onAction: () => {
-          const reverted: OmniTask = { ...task, timeLabel: prevTimeLabel, status: prevStatus };
-          setTasks((current) => current.map((item) => (item.id === task.id ? reverted : item)));
-          props.onCaptureSaved?.(reverted);
-          showSnackbar('Snooze cancelled', { icon: 'info' });
-        },
-      });
-    },
-    [showSnackbar, props]
-  );
+  const snoozeTask = (task: OmniTask, minutes: number) => runMutation(async () => {
+    await props.onTaskSnoozed?.(task.id, minutes);
+    setOverlay(null);
+    showSnackbar('Reminder snoozed for ' + minutes + ' min', {
+      icon: 'clock', actionLabel: 'Undo',
+      onAction: () => { void runMutation(async () => {
+        await props.onCaptureSaved?.(task);
+        setTasks((current) => current.map((item) => item.id === task.id ? task : item));
+        showSnackbar('Snooze cancelled', { icon: 'info' });
+      }); },
+    });
+  });
 
-  const deleteTask = useCallback(
-    (task: OmniTask) => {
-      setConfirmationConfig({
-        title: 'Delete reminder?',
-        message: `Are you sure you want to delete "${task.title}"? All scheduled alert milestones will be cancelled.`,
-        confirmLabel: 'Delete reminder',
-        cancelLabel: 'Keep reminder',
-        isDestructive: true,
-        onConfirm: () => {
-          props.onTaskDeleted?.(task.id);
-          setTasks((current) => current.filter((item) => item.id !== task.id));
-          setOverlay(null);
-          showSnackbar('Reminder deleted', {
-            icon: 'trash',
-            actionLabel: 'Undo',
-            onAction: () => {
-              setTasks((current) => [task, ...current]);
-              props.onCaptureSaved?.(task);
-              showSnackbar('Reminder restored', { icon: 'check' });
-            },
-          });
-        },
-      });
-    },
-    [showSnackbar, props]
-  );
+  const deleteTask = (task: OmniTask) => {
+    setConfirmationConfig({
+      title: 'Delete reminder?',
+      message: 'Delete "' + task.title + '"? All scheduled alert milestones will be cancelled.',
+      confirmLabel: 'Delete reminder', cancelLabel: 'Keep reminder', isDestructive: true,
+      onConfirm: () => { void runMutation(async () => {
+        await props.onTaskDeleted?.(task.id);
+        setTasks((current) => current.filter((item) => item.id !== task.id));
+        setOverlay(null);
+        showSnackbar('Reminder deleted', {
+          icon: 'trash', actionLabel: 'Undo',
+          onAction: () => { void runMutation(async () => {
+            await props.onCaptureSaved?.(task);
+            setTasks((current) => current.some((item) => item.id === task.id) ? current : [task, ...current]);
+            showSnackbar('Reminder restored');
+          }); },
+        });
+      }); },
+    });
+  };
 
-  const saveEditedTask = useCallback(
-    (updatedTask: OmniTask) => {
-      setTasks((current) => current.map((item) => (item.id === updatedTask.id ? updatedTask : item)));
-      props.onCaptureSaved?.(updatedTask);
-      setIsEditingDetail(false);
-      showSnackbar('Changes saved', { icon: 'check' });
-    },
-    [showSnackbar, props]
-  );
+  const saveEditedTask = (updatedTask: OmniTask) => runMutation(async () => {
+    await props.onCaptureSaved?.(updatedTask);
+    setTasks((current) => current.map((item) => item.id === updatedTask.id ? updatedTask : item));
+    setIsEditingDetail(false);
+    showSnackbar('Changes saved');
+  });
 
   // Android Hardware Back Button Unified Handler
   useEffect(() => {
@@ -630,6 +672,7 @@ export default function RemindlyDesignReference(props: Props) {
       // Priority 6: Close search if open
       if (searchOpen) {
         setSearchOpen(false);
+        setSearchTerm('');
         return true;
       }
       // Priority 7: Return to Today tab
@@ -656,79 +699,76 @@ export default function RemindlyDesignReference(props: Props) {
   const [captureDaysOffset, setCaptureDaysOffset] = useState<number>(2);
 
   const startQuickCapture = useCallback((mode: 'today' | 'tomorrow' | 'custom' | 'inbox' = 'today', offset: number = 2) => {
+    setEditingCaptureTask(undefined);
+    setSharedCapture(false);
+    setCaptureRevision((revision) => revision + 1);
+    quickCaptureIsDirtyRef.current = false;
     setCaptureDateMode(mode);
     setCaptureDaysOffset(offset);
     setOverlay('quick');
   }, []);
 
-  const saveCapture = useCallback((task: OmniTask) => {
-    setTasks((current) => [task, ...current]);
-    props.onCaptureSaved?.(task);
+  const saveCapture = useCallback(async (task: OmniTask) => {
+    const notificationsEnabled = await props.onCaptureSaved?.(task);
+    setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)]);
+    quickCaptureIsDirtyRef.current = false;
     setSelectedTaskId(task.id);
     setOverlay(null);
     setTab(task.status === 'inbox' ? 'inbox' : 'today');
-    notify(task.status === 'inbox' ? 'Saved to Inbox' : 'Reminder saved');
+    notify(task.status === 'inbox' ? 'Saved to Inbox' : notificationsEnabled === false ? 'Reminder saved. Notifications are disabled.' : 'Reminder saved');
   }, [notify, props]);
 
   const openTask = (task: OmniTask) => {
+    setIsEditingDetail(false);
     setSelectedTaskId(task.id);
     setOverlay('detail');
+  };
+
+  const updatePreference = async <T,>(value: T, previous: T, setter: (value: T) => void, persist?: (value: T) => void | Promise<any>) => {
+    setter(value);
+    try { await persist?.(value); }
+    catch { setter(previous); notify('Could not save this setting. Please try again.'); }
   };
 
   const renderContent = () => {
     if (tab === 'settings') {
       return (
         <SettingsScreen
+          quickCaptureAnywhere={quickCaptureAnywhere}
+          overlayPermissionGranted={overlayPermissionGranted}
+          onQuickCaptureAnywhereToggle={(enabled) => { void toggleOverlay(enabled); }}
+          onStopOverlayService={() => { void toggleOverlay(false); }}
+          onGrantOverlayPermission={async () => {
+            if (!(await quickCaptureOverlayService.openOverlaySettings())) notify('Overlay settings require an Android development build.');
+          }}
           quietHours={quietHours}
-          onQuietHours={(v) => {
-            setQuietHours(v);
-            props.onQuietHoursChange?.(v);
-          }}
+          onQuietHours={(value) => { void updatePreference(value, quietHours, setQuietHours, props.onQuietHoursChange); }}
           defaultProfile={defaultProfile}
-          onDefaultProfileChange={(p) => {
-            setDefaultProfile(p);
-            props.onDefaultProfileChange?.(p);
-          }}
-          dateOnlyTime={dateOnlyTime}
-          onDateOnlyTimeChange={(t) => {
-            setDateOnlyTime(t);
-            props.onDateOnlyTimeChange?.(t);
-          }}
+          onDefaultProfileChange={(value) => { void updatePreference(value, defaultProfile, setDefaultProfile, props.onDefaultProfileChange); }}
+          dateOnlyTime={formatTimeLabel(dateOnlyTime)}
+          onDateOnlyTimeChange={(value) => { void updatePreference(value, dateOnlyTime, setDateOnlyTime, props.onDateOnlyTimeChange); }}
           notificationsSound={notificationsSound}
-          onNotificationsSoundChange={(v) => {
-            setNotificationsSound(v);
-            props.onNotificationsSoundChange?.(v);
-          }}
+          onNotificationsSoundChange={(value) => { void updatePreference(value, notificationsSound, setNotificationsSound, props.onNotificationsSoundChange); }}
           notificationsVibration={notificationsVibration}
-          onNotificationsVibrationChange={(v) => {
-            setNotificationsVibration(v);
-            props.onNotificationsVibrationChange?.(v);
-          }}
+          onNotificationsVibrationChange={(value) => { void updatePreference(value, notificationsVibration, setNotificationsVibration, props.onNotificationsVibrationChange); }}
           persistentFollowups={persistentFollowups}
-          onPersistentFollowupsChange={(v) => {
-            setPersistentFollowups(v);
-            props.onPersistentFollowupsChange?.(v);
-          }}
+          onPersistentFollowupsChange={(value) => { void updatePreference(value, persistentFollowups, setPersistentFollowups, props.onPersistentFollowupsChange); }}
           lockScreenPrivacy={lockScreenPrivacy}
-          onLockScreenPrivacyChange={(v) => {
-            setLockScreenPrivacy(v);
-            props.onLockScreenPrivacyChange?.(v);
-          }}
+          onLockScreenPrivacyChange={(value) => { void updatePreference(value, lockScreenPrivacy, setLockScreenPrivacy, props.onLockScreenPrivacyChange); }}
           notificationsAllowed={props.notificationsAllowed}
-          onOpenNotificationSettings={props.onOpenNotificationSettings}
+          onOpenNotificationSettings={async () => {
+            try { await props.onOpenNotificationSettings?.(); }
+            catch { notify('Open your device settings to manage notifications.'); }
+          }}
           testSent={testSent}
           onTest={async () => {
-            if (props.notificationsAllowed === false) {
-              notify('Notifications disabled. Enable in system settings.');
-              return;
-            }
             setTestSent(true);
             try {
               const res = await props.onTestNotification?.();
               if (res === false) {
                 notify('Could not schedule test. Permissions may be missing.');
               } else {
-                notify('Test reminder scheduled for 5 seconds from now');
+                notify('Test reminder scheduled for 2 seconds from now');
               }
             } catch (e) {
               notify('Test reminder failed to schedule.');
@@ -741,13 +781,13 @@ export default function RemindlyDesignReference(props: Props) {
       );
     }
     if (tab === 'calendar') {
-      return <CalendarScreen tasks={tasks} onOpenTask={openTask} onAdd={startQuickCapture} />;
+      return <CalendarScreen tasks={visibleTasks} onOpenTask={openTask} onAdd={startQuickCapture} />;
     }
     if (tab === 'activity') {
       return <ActivityScreen tasks={visibleTasks} onOpenTask={openTask} />;
     }
     if (tab === 'inbox') {
-      return <InboxScreen tasks={visibleTasks} onOpenTask={openTask} onAdd={startQuickCapture} />;
+      return <InboxScreen tasks={visibleTasks} onOpenTask={openTask} onAdd={() => startQuickCapture('inbox')} />;
     }
     return (
       <TodayScreen
@@ -794,14 +834,17 @@ export default function RemindlyDesignReference(props: Props) {
               searchTerm={searchTerm}
               hasInboxMessages={tasks.some((t) => t.status === 'inbox')}
               onSearchTerm={setSearchTerm}
-              onToggleSearch={() => setSearchOpen((value) => !value)}
+              onToggleSearch={() => { if (searchOpen) setSearchTerm(''); setSearchOpen((value) => !value); }}
               onOpenAccount={() => setOverlay('account')}
               onBell={() => {
-                const task = tasks.find((item) => item.status === 'overdue') ?? tasks.find((item) => item.status !== 'done');
+                const scheduled = tasks.filter((item) => item.status !== 'done' && item.status !== 'inbox')
+                  .sort((a, b) => Date.parse(a.dueAtUtc || '') - Date.parse(b.dueAtUtc || ''));
+                const task = scheduled[0];
                 if (task) {
                   setSelectedTaskId(task.id);
                   setOverlay('reminder');
-                } else notify('You are all caught up');
+                } else if (tasks.some((item) => item.status === 'inbox')) setTab('inbox');
+                else notify('You are all caught up');
               }}
             />
             <View style={styles.topDivider} />
@@ -815,7 +858,7 @@ export default function RemindlyDesignReference(props: Props) {
                 {renderContent()}
               </ScrollView>
             </View>
-            <BottomNav tab={tab} onTab={setTab} onAdd={startQuickCapture} blurTarget={blurTargetRef} bottomInset={bottomInset} />
+            <BottomNav tab={tab} onTab={setTab} onAdd={() => startQuickCapture()} blurTarget={blurTargetRef} bottomInset={bottomInset} />
           </View>
         </LinearGradient>
       </BlurTargetView>
@@ -839,16 +882,23 @@ export default function RemindlyDesignReference(props: Props) {
           />
           {overlay === 'quick' && (
             <QuickCaptureSheet
-              initialText={props.initialSharedText ?? ''}
-              initialSource={props.initialSource ?? 'Manual'}
+              key={captureRevision}
+              editingTask={editingCaptureTask}
+              initialText={sharedCapture ? props.initialSharedText ?? '' : ''}
+              initialSource={sharedCapture ? props.initialSource ?? 'Manual' : 'Manual'}
               defaultProfile={defaultProfile}
-              initialSourceUrl={props.initialSourceUrl}
+              dateOnlyTime={dateOnlyTime}
+              initialSourceUrl={sharedCapture ? props.initialSourceUrl : undefined}
+              initialSubject={sharedCapture ? props.initialSourceSubject : undefined}
+              initialSender={sharedCapture ? props.initialSourceSender : undefined}
+              initialTitle={sharedCapture ? props.initialSharedTitle : undefined}
               initialDateMode={captureDateMode}
               initialDaysOffset={captureDaysOffset}
               blurTarget={blurTargetRef}
               bottomInset={bottomInset}
               onClose={handleCloseQuickCapture}
               onSave={saveCapture}
+              onError={notify}
               onDirtyChange={(dirty) => {
                 quickCaptureIsDirtyRef.current = dirty;
               }}
@@ -862,7 +912,7 @@ export default function RemindlyDesignReference(props: Props) {
               bottomInset={bottomInset}
               onClose={() => setOverlay(null)}
               onLogout={handleUserLogout}
-              onConnectGoogle={() => setOverlay('sign_in')}
+              onConnectGoogle={handleAccountSwitch}
             />
           )}
           {overlay === 'sign_in' && (
@@ -870,9 +920,9 @@ export default function RemindlyDesignReference(props: Props) {
               blurTarget={blurTargetRef}
               bottomInset={bottomInset}
               onClose={() => setOverlay(null)}
-              onSignIn={(u) => {
-                handleUserLogin(u);
-                notify(`Welcome, ${u.name}!`);
+              onSignIn={async (u) => {
+                await handleUserLogin(u);
+                notify(u.isLoggedIn ? `Welcome, ${u.name}!` : 'Continuing as guest');
               }}
             />
           )}
@@ -888,6 +938,7 @@ export default function RemindlyDesignReference(props: Props) {
           {overlay === 'detail' && selectedTask && (
             <TaskDetailsSheet
               task={selectedTask}
+              bottomInset={bottomInset}
               blurTarget={blurTargetRef}
               isEditing={isEditingDetail}
               onToggleEdit={setIsEditingDetail}
@@ -899,6 +950,16 @@ export default function RemindlyDesignReference(props: Props) {
               onSnooze={(minutes) => snoozeTask(selectedTask, minutes)}
               onDelete={() => deleteTask(selectedTask)}
               onSaveEdit={saveEditedTask}
+              onReschedule={() => {
+                setEditingCaptureTask(selectedTask);
+                setSharedCapture(false);
+                const target = selectedTask.dueAtUtc ? new Date(selectedTask.dueAtUtc) : new Date();
+                const selection = captureDateSelection(target);
+                setCaptureDateMode(selection.offset <= 0 ? 'today' : selection.mode);
+                setCaptureDaysOffset(Math.max(0, selection.offset));
+                setCaptureRevision((revision) => revision + 1);
+                setOverlay('quick');
+              }}
               onOpenSource={() => {
                 if (selectedTask.sourceUrl) {
                   Linking.openURL(selectedTask.sourceUrl).catch(() => {
@@ -959,8 +1020,8 @@ export default function RemindlyDesignReference(props: Props) {
           <OnboardingScreen
             topInset={topInset}
             bottomInset={bottomInset}
-            onClose={() => setOverlay(null)}
-            onStart={() => setOverlay(null)}
+            onClose={() => { void props.onOnboardingDismissed?.(); setOverlay(null); }}
+            onStart={() => { void props.onOnboardingDismissed?.(); setOverlay(null); }}
             onGoogleSignIn={handleUserLogin}
             onOpenSignIn={() => setOverlay('sign_in')}
           />
@@ -1276,7 +1337,7 @@ function TodayScreen(props: {
       const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const targetMidnight = new Date(viewYear, viewMonth, selectedDay);
       const diffDays = Math.round((targetMidnight.getTime() - todayMidnight.getTime()) / (1000 * 60 * 60 * 24));
-      if (diffDays >= 0 && diffDays < 28) {
+      if (diffDays >= 0) {
         props.onAdd('custom', diffDays);
       } else {
         props.onAdd('today', 0);
@@ -1519,7 +1580,7 @@ function TaskTimelineRow({ task, index, onPress, onComplete }: { task: OmniTask;
   );
 }
 
-function CalendarScreen({ tasks, onOpenTask, onAdd }: { tasks: OmniTask[]; onOpenTask: (task: OmniTask) => void; onAdd: () => void }) {
+function CalendarScreen({ tasks, onOpenTask, onAdd }: { tasks: OmniTask[]; onOpenTask: (task: OmniTask) => void; onAdd: (mode: CaptureDateMode, offset: number) => void }) {
   const [week, setWeek] = useState(0);
   const [selectedDayOffset, setSelectedDayOffset] = useState(() => (new Date().getDay() + 6) % 7);
   const weekDays = useMemo(() => {
@@ -1565,6 +1626,11 @@ function CalendarScreen({ tasks, onOpenTask, onAdd }: { tasks: OmniTask[]; onOpe
       return (a.createdAt || 0) - (b.createdAt || 0);
     });
   }, [tasks, activeDay]);
+  const addForSelectedDate = () => {
+    if (isCalPastDay) return;
+    const selection = captureDateSelection(activeDay.date);
+    onAdd(selection.mode, selection.offset);
+  };
   const heading = week === 0 ? 'This week' : week === -1 ? 'Last week' : week === 1 ? 'Next week' : `${week > 0 ? '+' : ''}${week} weeks`;
 
   return (
@@ -1618,7 +1684,7 @@ function CalendarScreen({ tasks, onOpenTask, onAdd }: { tasks: OmniTask[]; onOpe
           </Text>
         </View>
         {!isCalPastDay && (
-          <Pressable onPress={onAdd} style={styles.rAddRound}><Plus size={17} color={C.black} /></Pressable>
+          <Pressable onPress={addForSelectedDate} style={styles.rAddRound}><Plus size={17} color={C.black} /></Pressable>
         )}
       </View>
 
@@ -1643,9 +1709,9 @@ function CalendarScreen({ tasks, onOpenTask, onAdd }: { tasks: OmniTask[]; onOpe
         <View style={styles.rCalendarEmpty}>
           <View style={styles.rCalendarEmptyGlyph}><CalendarDays size={21} color={C.lime} /></View>
           <Text style={styles.rCalendarEmptyTitle}>Nothing scheduled here.</Text>
-          <Text style={styles.rCalendarEmptyBody}>{week === 0 && activeDay?.isToday ? 'Your day is clear. Capture a commitment whenever one comes in.' : 'This reference build only includes sample tasks for today and tomorrow.'}</Text>
+          <Text style={styles.rCalendarEmptyBody}>{week === 0 && activeDay?.isToday ? 'Your day is clear. Capture a commitment whenever one comes in.' : 'Capture a reminder for this date whenever you need one.'}</Text>
           {!isCalPastDay && (
-            <Pressable onPress={onAdd} style={styles.rCalendarEmptyAction}><Plus size={15} color={C.black} /><Text style={styles.rCalendarEmptyActionText}>Add reminder</Text></Pressable>
+            <Pressable onPress={addForSelectedDate} style={styles.rCalendarEmptyAction}><Plus size={15} color={C.black} /><Text style={styles.rCalendarEmptyActionText}>Add reminder</Text></Pressable>
           )}
         </View>
       )}
@@ -1828,7 +1894,7 @@ function SettingsScreen({
         <View style={styles.rSettingsOptionRow}>
           <View style={styles.rSettingsOptionIcon}><Clock3 size={17} color={C.lime} /></View>
           <View style={{ flex: 1 }}><Text style={styles.rSettingsOptionTitle}>Date-only time</Text><Text style={styles.rSettingsOptionDetail}>Used when a message gives a day but no time.</Text></View>
-          <Pressable accessibilityLabel="Change date-only reminder time" onPress={() => onDateOnlyTimeChange(times[(times.indexOf(dateOnlyTime) + 1) % times.length])} style={styles.rTimeSelector}><Text style={styles.rTimeSelectorText}>{dateOnlyTime}</Text><ChevronDown size={13} color={C.lime} /></Pressable>
+          <Pressable accessibilityLabel="Change date-only reminder time" onPress={() => onDateOnlyTimeChange(times[(times.findIndex((time) => time.replace(/^0/, '') === dateOnlyTime.replace(/^0/, '')) + 1) % times.length])} style={styles.rTimeSelector}><Text style={styles.rTimeSelectorText}>{dateOnlyTime}</Text><ChevronDown size={13} color={C.lime} /></Pressable>
         </View>
 
         <View style={styles.rSettingsOptionDivider} />
@@ -2014,7 +2080,7 @@ function OnboardingScreen({
   bottomInset: number;
   onClose: () => void;
   onStart: () => void;
-  onGoogleSignIn: (user: UserProfile) => void;
+  onGoogleSignIn: (user: UserProfile) => void | Promise<void>;
   onOpenSignIn?: () => void;
 }) {
   const [signingIn, setSigningIn] = useState(false);
@@ -2032,58 +2098,28 @@ function OnboardingScreen({
   }, []);
 
   const handleGooglePress = async () => {
+    if (signingIn) return;
     try {
       setSigningIn(true);
       const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
       const redirectUrl = isExpoGo
         ? AuthSession.makeRedirectUri({ path: 'oauth-native-callback' })
         : AuthSession.makeRedirectUri({ scheme: 'remindly', path: 'oauth-native-callback' });
-
-      console.log('[Remindly] Starting Clerk Google OAuth with redirectUrl:', redirectUrl);
-
-      const res = await startOAuthFlow({ redirectUrl });
-      if (res?.createdSessionId && res.setActive) {
-        await res.setActive({ session: res.createdSessionId });
+      const result = await startOAuthFlow({ redirectUrl });
+      if (result.createdSessionId && result.setActive) {
+        await result.setActive({ session: result.createdSessionId });
         onClose();
-      } else {
-        console.warn('[Remindly] OAuth flow completed without createdSessionId (Expo Go / unhandled redirect). Using authenticated dev profile.');
-        const devGoogleUser: UserProfile = {
-          isLoggedIn: true,
-          name: 'Affan Mushtaque',
-          email: 'affan.mushtaque@gmail.com',
-          avatarInitial: 'AM',
-          authProvider: 'google',
-        };
-        onGoogleSignIn(devGoogleUser);
-        onClose();
+      } else if (result.authSessionResult?.type !== 'cancel' && result.authSessionResult?.type !== 'dismiss') {
+        Alert.alert('Sign-in incomplete', 'Google sign-in did not finish. Please try again.');
       }
-    } catch (err) {
-      console.warn('[Remindly] Clerk Google OAuth note:', err);
-      // Fallback dev account if OAuth popup is closed or testing offline
-      const devGoogleUser: UserProfile = {
-        isLoggedIn: true,
-        name: 'Affan Mushtaque',
-        email: 'affan.mushtaque@gmail.com',
-        avatarInitial: 'AM',
-        authProvider: 'google',
-      };
-      onGoogleSignIn(devGoogleUser);
-      onClose();
-    } finally {
-      setSigningIn(false);
-    }
+    } catch (error) {
+      Alert.alert('Could not sign in', 'Google sign-in failed. Please try again or continue as a guest.');
+    } finally { setSigningIn(false); }
   };
 
-  const handleGuestPress = () => {
-    const guestUser: UserProfile = {
-      isLoggedIn: true,
-      name: 'Local User',
-      email: 'local@device',
-      avatarInitial: 'U',
-      authProvider: 'guest',
-    };
-    onGoogleSignIn(guestUser);
-    onClose();
+  const handleGuestPress = async () => {
+    try { await onGoogleSignIn({ ...DEFAULT_USER }); onClose(); }
+    catch { Alert.alert('Could not continue', 'Please try again.'); }
   };
 
   return (
@@ -2161,38 +2197,52 @@ function OnboardingScreen({
 }
 
 function QuickCaptureSheet({
+  editingTask,
   initialText,
   initialSource,
   initialSourceUrl,
   defaultProfile,
+  dateOnlyTime,
+  initialSubject,
+  initialSender,
+  initialTitle,
   initialDateMode = 'today',
   initialDaysOffset = 2,
   blurTarget,
   bottomInset,
   onClose,
   onSave,
+  onError,
   onDirtyChange,
   onOpenProfileSelector,
 }: {
+  editingTask?: OmniTask;
   initialText: string;
   initialSource: TaskSource;
   initialSourceUrl?: string;
   defaultProfile: ProfileKey;
+  dateOnlyTime: string;
+  initialSubject?: string;
+  initialSender?: string;
+  initialTitle?: string;
   initialDateMode?: 'today' | 'tomorrow' | 'custom' | 'inbox';
   initialDaysOffset?: number;
   blurTarget: React.RefObject<any>;
   bottomInset: number;
   onClose: () => void;
-  onSave: (task: OmniTask) => void;
+  onSave: (task: OmniTask) => void | Promise<void>;
+  onError: (message: string) => void;
   onDirtyChange?: (isDirty: boolean) => void;
   onOpenProfileSelector?: (currentProfile: ProfileKey, onSelect: (p: ProfileKey) => void) => void;
 }) {
   const suggestedTitle = useMemo(() => {
+    if (editingTask) return editingTask.title;
+    if (initialTitle?.trim()) return initialTitle.trim();
     const normalized = initialText.trim().replace(/\s+/g, ' ');
     if (!normalized) return '';
     const firstSentence = normalized.split(/[.!?](?:\s|$)/)[0];
     return firstSentence.length > 74 ? `${firstSentence.slice(0, 71).trim()}…` : firstSentence;
-  }, [initialText]);
+  }, [initialText, initialTitle, editingTask]);
 
   const [title, setTitle] = useState(suggestedTitle);
 
@@ -2205,14 +2255,14 @@ function QuickCaptureSheet({
       }
     }
   };
-  const [profile, setProfile] = useState<ProfileKey>(defaultProfile);
+  const [profile, setProfile] = useState<ProfileKey>(editingTask?.profile || defaultProfile);
   const [showProfiles, setShowProfiles] = useState(false);
   const [showSource, setShowSource] = useState(Boolean(initialText));
   const [saving, setSaving] = useState(false);
-  const sourceExcerpt = initialText.trim() || 'No message attached. Add a short note or create a reminder from scratch.';
+  const sourceExcerpt = editingTask?.excerpt || initialText.trim() || '';
 
   useEffect(() => {
-    const isDirty = Boolean(title.trim().length > 0 && title !== suggestedTitle);
+    const isDirty = Boolean(title.trim().length > 0 || initialText.trim());
     onDirtyChange?.(isDirty);
   }, [title, suggestedTitle, onDirtyChange]);
 
@@ -2220,7 +2270,7 @@ function QuickCaptureSheet({
   const [useDeadline, setUseDeadline] = useState(initialDateMode !== 'inbox');
   const [selectedDateMode, setSelectedDateMode] = useState<'today' | 'tomorrow' | 'custom' | 'inbox'>(initialDateMode);
   const [customDaysOffset, setCustomDaysOffset] = useState<number>(initialDaysOffset);
-  const [isImportant, setIsImportant] = useState<boolean>(defaultProfile === 'Important');
+  const [isImportant, setIsImportant] = useState<boolean>(editingTask?.important ?? defaultProfile === 'Important');
 
   // Smart auto-detection helper for incoming or typed context
   const detectSource = (txt: string): TaskSource => {
@@ -2235,6 +2285,7 @@ function QuickCaptureSheet({
   };
 
   const [selectedSource, setSelectedSource] = useState<TaskSource>(() => {
+    if (editingTask) return editingTask.source;
     if (initialSource && initialSource !== 'Manual') return initialSource;
     if (initialText) {
       const detected = detectSource(initialText);
@@ -2246,25 +2297,62 @@ function QuickCaptureSheet({
 
   // Initialize time dynamically to a future time (+10 min) rounded to next 5 minutes
   const getFutureInitialTime = (offsetMins = 10) => {
-    const d = new Date(Date.now() + offsetMins * 60 * 1000);
+    const d = futureCaptureTime(new Date(), offsetMins);
     let h = d.getHours();
     const p: 'AM' | 'PM' = h >= 12 ? 'PM' : 'AM';
     h = h % 12;
     if (h === 0) h = 12;
-    const roundedM = (Math.ceil(d.getMinutes() / 5) * 5) % 60;
-    return { hour: h, minute: roundedM, period: p };
+    return { hour: h, minute: d.getMinutes(), period: p, date: d };
   };
 
-  const initialTime = useMemo(() => getFutureInitialTime(10), []);
+  const defaultTime = () => {
+    const match = formatTimeLabel(dateOnlyTime).match(/^(\d{1,2}):(\d{2}) (AM|PM)$/);
+    return { hour: match ? Number(match[1]) : 9, minute: match ? Number(match[2]) : 0, period: (match?.[3] || 'AM') as 'AM' | 'PM' };
+  };
+  const initialTime = useMemo(() => {
+    if (editingTask?.dueAtUtc && Date.parse(editingTask.dueAtUtc) > Date.now()) {
+      const date = new Date(editingTask.dueAtUtc);
+      return { hour: date.getHours() % 12 || 12, minute: date.getMinutes(), period: (date.getHours() >= 12 ? 'PM' : 'AM') as 'AM' | 'PM' };
+    }
+    return initialDateMode === 'tomorrow' || initialDateMode === 'custom' ? defaultTime() : getFutureInitialTime(10);
+  }, []);
   const [selectedHour, setSelectedHour] = useState<number>(initialTime.hour);
   const [selectedMinute, setSelectedMinute] = useState<number>(initialTime.minute);
   const [minuteInputStr, setMinuteInputStr] = useState<string>(initialTime.minute < 10 ? `0${initialTime.minute}` : `${initialTime.minute}`);
   const [selectedPeriod, setSelectedPeriod] = useState<'AM' | 'PM'>(initialTime.period);
   const [showTimePicker, setShowTimePicker] = useState(true);
+  const [saveError, setSaveError] = useState('');
+
+  useEffect(() => {
+    if (initialText.trim() && !editingTask) {
+      const parsed = parseCaptureText(initialText, new Date(), Intl.DateTimeFormat().resolvedOptions().timeZone, { defaultDateOnlyTime: dateOnlyTime });
+      if (parsed.kind === 'ambiguous') {
+        setUseDeadline(false);
+        setSelectedDateMode('inbox');
+        return;
+      }
+      if (parsed.primaryCandidate) {
+        const target = new Date(parsed.primaryCandidate.instantUtc);
+        const selection = captureDateSelection(target);
+        setSelectedDateMode(selection.mode);
+        setCustomDaysOffset(selection.offset);
+        setSelectedHour(target.getHours() % 12 || 12);
+        setSelectedMinute(target.getMinutes());
+        setMinuteInputStr(String(target.getMinutes()).padStart(2, '0'));
+        setSelectedPeriod(target.getHours() >= 12 ? 'PM' : 'AM');
+        return;
+      }
+    }
+    if (initialDateMode === 'today') {
+      const selection = captureDateSelection(futureCaptureTime());
+      setSelectedDateMode(selection.mode);
+      setCustomDaysOffset(selection.offset);
+    }
+  }, []);
 
   // Check if selected time is in the past for today
   const isPastTimeToday = useMemo(() => {
-    if (!useDeadline || selectedDateMode !== 'today') return false;
+    if (!useDeadline || (selectedDateMode !== 'today' && !(selectedDateMode === 'custom' && customDaysOffset === 0))) return false;
     let h24 = selectedHour;
     if (selectedPeriod === 'PM' && h24 < 12) h24 += 12;
     else if (selectedPeriod === 'AM' && h24 === 12) h24 = 0;
@@ -2272,11 +2360,11 @@ function QuickCaptureSheet({
     const cur = new Date();
     const currentTotalMins = cur.getHours() * 60 + cur.getMinutes();
     return chosenTotalMins <= currentTotalMins;
-  }, [useDeadline, selectedDateMode, selectedHour, selectedMinute, selectedPeriod]);
+  }, [useDeadline, selectedDateMode, customDaysOffset, selectedHour, selectedMinute, selectedPeriod]);
 
   // Generate 28 upcoming days for custom date picker
   const upcomingDays = useMemo(() => {
-    return Array.from({ length: 28 }, (_, idx) => {
+    return Array.from({ length: Math.max(28, initialDaysOffset + 1) }, (_, idx) => {
       const d = new Date();
       d.setDate(d.getDate() + idx);
       return {
@@ -2323,16 +2411,20 @@ function QuickCaptureSheet({
     setUseDeadline(true);
     setSelectedDateMode(mode);
     if (mode === 'tomorrow' || mode === 'custom') {
-      setSelectedHour(9);
-      setSelectedMinute(0);
-      setMinuteInputStr('00');
-      setSelectedPeriod('AM');
+      const time = defaultTime();
+      setSelectedHour(time.hour);
+      setSelectedMinute(time.minute);
+      setMinuteInputStr(String(time.minute).padStart(2, '0'));
+      setSelectedPeriod(time.period);
     } else {
       const fut = getFutureInitialTime(10);
       setSelectedHour(fut.hour);
       setSelectedMinute(fut.minute);
       setMinuteInputStr(fut.minute < 10 ? `0${fut.minute}` : `${fut.minute}`);
       setSelectedPeriod(fut.period);
+      const selection = captureDateSelection(fut.date);
+      setSelectedDateMode(selection.mode);
+      setCustomDaysOffset(selection.offset);
     }
   };
 
@@ -2346,8 +2438,10 @@ function QuickCaptureSheet({
 
   const applyOffsetMinutes = (mins: number) => {
     setUseDeadline(true);
-    setSelectedDateMode('today');
     const d = new Date(Date.now() + mins * 60 * 1000);
+    const selection = captureDateSelection(d);
+    setSelectedDateMode(selection.mode);
+    setCustomDaysOffset(selection.offset);
     let h = d.getHours();
     const p: 'AM' | 'PM' = h >= 12 ? 'PM' : 'AM';
     h = h % 12;
@@ -2359,28 +2453,20 @@ function QuickCaptureSheet({
   };
 
   const applyOffsetHours = (offset: number) => {
-    setUseDeadline(true);
-    const d = new Date();
-    d.setHours(d.getHours() + offset);
-    let h = d.getHours();
-    const p: 'AM' | 'PM' = h >= 12 ? 'PM' : 'AM';
-    h = h % 12;
-    if (h === 0) h = 12;
-    setSelectedHour(h);
-    setSelectedMinute(0);
-    setMinuteInputStr('00');
-    setSelectedPeriod(p);
-    if (d.getDate() !== new Date().getDate()) {
-      setSelectedDateMode('tomorrow');
-    }
+    applyOffsetMinutes(offset * 60);
   };
 
   const adjustMinute = (delta: number) => {
-    let next = selectedMinute + delta;
-    if (next < 0) next = 60 + (next % 60);
-    if (next >= 60) next = next % 60;
-    setSelectedMinute(next);
-    setMinuteInputStr(next < 10 ? `0${next}` : `${next}`);
+    const target = captureDeadline(selectedDateMode, customDaysOffset, selectedHour, selectedMinute, selectedPeriod);
+    if (!target) return;
+    target.setMinutes(target.getMinutes() + delta);
+    const selection = captureDateSelection(target);
+    setSelectedDateMode(selection.mode);
+    setCustomDaysOffset(selection.offset);
+    setSelectedHour(target.getHours() % 12 || 12);
+    setSelectedPeriod(target.getHours() >= 12 ? 'PM' : 'AM');
+    setSelectedMinute(target.getMinutes());
+    setMinuteInputStr(String(target.getMinutes()).padStart(2, '0'));
   };
 
   const handleMinuteTextChange = (text: string) => {
@@ -2392,11 +2478,17 @@ function QuickCaptureSheet({
     }
   };
 
-  const handleSave = () => {
-    if (isPastTimeToday) return;
+  const handleSave = async () => {
+    const deadline = captureDeadline(useDeadline ? selectedDateMode : 'inbox', customDaysOffset, selectedHour, selectedMinute, selectedPeriod);
+    if (deadline && deadline.getTime() <= Date.now()) {
+      setSaveError('Choose a future date and time.');
+      onError('Choose a future date and time.');
+      return;
+    }
     const finalTitle = title.trim() || (suggestedTitle.trim() ? suggestedTitle : 'Quick reminder');
     if (saving) return;
     setSaving(true);
+    setSaveError('');
 
     let dueLocalDate: string | undefined = undefined;
     let dueLocalTime: string | undefined = undefined;
@@ -2428,23 +2520,29 @@ function QuickCaptureSheet({
     }
 
     const newTask: OmniTask = {
-      id: `task-${Date.now()}`,
+      ...editingTask,
+      id: editingTask?.id || `task-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       title: finalTitle,
       timeLabel: useDeadline ? formattedTime : 'No deadline',
       dateLabel: useDeadline ? formattedDate : 'Inbox',
       status: useDeadline ? 'upcoming' : 'inbox',
       source: selectedSource,
       excerpt: sourceExcerpt,
-      sourceUrl: initialSourceUrl,
+      sourceUrl: initialSourceUrl || editingTask?.sourceUrl,
+      sourceSubject: initialSubject || editingTask?.sourceSubject,
+      sourceSender: initialSender || editingTask?.sourceSender,
       important: isImportant,
       profile: isImportant && profile === 'Simple' ? 'Important' : profile,
-      createdAt: Date.now(),
+      createdAt: editingTask?.createdAt || Date.now(),
+      completedAt: undefined,
       dueLocalDate,
       dueLocalTime,
       dueAtUtc,
       duePrecision: useDeadline ? 'datetime' : 'none',
     };
-    setTimeout(() => onSave(newTask), 140);
+    try { await onSave(newTask); }
+    catch { setSaveError('Could not save reminder. Please try again.'); onError('Could not save reminder. Please try again.'); }
+    finally { setSaving(false); }
   };
 
   return (
@@ -2495,7 +2593,7 @@ function QuickCaptureSheet({
             <TextInput
               value={title}
               onChangeText={handleTitleChange}
-              placeholder="What do you need to remember?"
+              placeholder={saveError || 'What do you need to remember?'}
               placeholderTextColor={C.muted2}
               multiline
               style={styles.rTitleInput}
@@ -2781,7 +2879,7 @@ function SignInSheet({
   blurTarget: React.RefObject<any>;
   bottomInset: number;
   onClose: () => void;
-  onSignIn: (user: UserProfile) => void;
+  onSignIn: (user: UserProfile) => void | Promise<void>;
 }) {
   const [signingIn, setSigningIn] = useState(false);
   const [nameInput, setNameInput] = useState('');
@@ -2797,66 +2895,71 @@ function SignInSheet({
   }, []);
 
   const handleGoogleOAuth = async () => {
+    if (signingIn) return;
     try {
       setSigningIn(true);
       const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
       const redirectUrl = isExpoGo
         ? AuthSession.makeRedirectUri({ path: 'oauth-native-callback' })
         : AuthSession.makeRedirectUri({ scheme: 'remindly', path: 'oauth-native-callback' });
-
-      console.log('[Remindly] Starting Clerk Google OAuth with redirectUrl:', redirectUrl);
-      const res = await startOAuthFlow({ redirectUrl });
-
-      if (res?.createdSessionId && res.setActive) {
-        await res.setActive({ session: res.createdSessionId });
+      const result = await startOAuthFlow({ redirectUrl });
+      if (result.createdSessionId && result.setActive) {
+        await result.setActive({ session: result.createdSessionId });
         onClose();
-      } else {
-        const demoUser: UserProfile = {
-          isLoggedIn: true,
-          name: 'Affan Mushtaque',
-          email: 'affan.mushtaque@gmail.com',
-          avatarInitial: 'AM',
-          authProvider: 'google',
-        };
-        onSignIn(demoUser);
-        onClose();
+      } else if (result.authSessionResult?.type !== 'cancel' && result.authSessionResult?.type !== 'dismiss') {
+        Alert.alert('Sign-in incomplete', 'Google sign-in did not finish. Please try again.');
       }
-    } catch (err: any) {
-      console.warn('[Remindly] Google OAuth attempt:', err);
-      const demoUser: UserProfile = {
-        isLoggedIn: true,
-        name: 'Affan Mushtaque',
-        email: 'affan.mushtaque@gmail.com',
-        avatarInitial: 'AM',
-        authProvider: 'google',
-      };
-      onSignIn(demoUser);
-      onClose();
-    } finally {
-      setSigningIn(false);
-    }
+    } catch (error) {
+      Alert.alert('Could not sign in', 'Google sign-in failed. Please try again or continue as a guest.');
+    } finally { setSigningIn(false); }
   };
 
-  const handleManualSignIn = () => {
-    const trimmedName = nameInput.trim() || 'Remindly User';
-    const trimmedEmail = emailInput.trim() || `${trimmedName.toLowerCase().replace(/\s+/g, '.')}@example.com`;
-    const initials = trimmedName
-      .split(' ')
-      .map((p) => p[0])
-      .filter(Boolean)
-      .slice(0, 2)
-      .join('')
-      .toUpperCase() || 'U';
+  const { signIn, isLoaded: signInLoaded, setActive } = useSignIn();
+  const { signUp, isLoaded: signUpLoaded } = useSignUp();
+  const [emailStep, setEmailStep] = useState<'email' | 'signInCode' | 'signUpCode'>('email');
+  const [code, setCode] = useState('');
 
-    const customUser: UserProfile = {
-      isLoggedIn: true,
-      name: trimmedName,
-      email: trimmedEmail,
-      avatarInitial: initials,
-      authProvider: 'email',
-    };
-    onSignIn(customUser);
-    onClose();
+  const handleManualSignIn = async () => {
+    if (signingIn || !signInLoaded || !signUpLoaded) return;
+    setSigningIn(true);
+    try {
+      if (emailStep !== 'email') {
+        const result = emailStep === 'signInCode'
+          ? await signIn.attemptFirstFactor({ strategy: 'email_code', code: code.trim() })
+          : await signUp.attemptEmailAddressVerification({ code: code.trim() });
+        if (result.status !== 'complete' || !result.createdSessionId) {
+          Alert.alert('Additional verification required', 'This account requires more verification. Please continue with Google or review your Clerk sign-in settings.');
+          return;
+        }
+        await setActive({ session: result.createdSessionId });
+        onClose();
+        return;
+      }
+      const email = emailInput.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        Alert.alert('Enter your email', 'Please enter a valid email address.');
+        return;
+      }
+      try {
+        const attempt = await signIn.create({ identifier: email });
+        const factor = attempt.supportedFirstFactors?.find((item) => item.strategy === 'email_code');
+        if (!factor || factor.strategy !== 'email_code') {
+          Alert.alert('Email codes unavailable', 'Email code sign-in must be enabled in Clerk. You can also continue with Google.');
+          return;
+        }
+        await signIn.prepareFirstFactor({ strategy: 'email_code', emailAddressId: factor.emailAddressId });
+        setEmailStep('signInCode');
+      } catch (error: any) {
+        if (!error.errors?.some((item: any) => item.code === 'form_identifier_not_found')) throw error;
+        const names = nameInput.trim().split(/\s+/).filter(Boolean);
+        await signUp.create({ emailAddress: email, ...(names.length ? { firstName: names[0], lastName: names.slice(1).join(' ') || undefined } : {}) });
+        await signUp.prepareEmailAddressVerification({ strategy: 'email_code' });
+        setEmailStep('signUpCode');
+      }
+      Alert.alert('Check your email', 'Enter the verification code sent to ' + email + '.');
+    } catch (error: any) {
+      Alert.alert('Could not sign in', error.errors?.[0]?.longMessage || error.errors?.[0]?.message || 'Please try again.');
+    } finally { setSigningIn(false); }
   };
 
   return (
@@ -2913,14 +3016,14 @@ function SignInSheet({
 
           {/* Interactive Email Field */}
           <View style={styles.signInInputGroup}>
-            <Text style={styles.signInInputLabel}>EMAIL ADDRESS</Text>
+            <Text style={styles.signInInputLabel}>{emailStep === 'email' ? 'EMAIL ADDRESS' : 'VERIFICATION CODE'}</Text>
             <View style={styles.signInInputBox}>
               <TextInput
-                value={emailInput}
-                onChangeText={setEmailInput}
-                placeholder="e.g. maya@example.com"
+                value={emailStep === 'email' ? emailInput : code}
+                onChangeText={emailStep === 'email' ? setEmailInput : setCode}
+                placeholder={emailStep === 'email' ? 'e.g. maya@example.com' : 'Enter your email code'}
                 placeholderTextColor="rgba(248,245,237,0.4)"
-                keyboardType="email-address"
+                keyboardType={emailStep === 'email' ? 'email-address' : 'number-pad'}
                 autoCapitalize="none"
                 style={styles.signInTextInput}
               />
@@ -2928,31 +3031,24 @@ function SignInSheet({
           </View>
 
           {/* Direct Sign-In Button */}
-          <Pressable onPress={handleManualSignIn} style={styles.signInDirectBtn} accessibilityLabel="Sign In and Keep Reminders">
+          <Pressable disabled={signingIn} onPress={handleManualSignIn} style={styles.signInDirectBtn} accessibilityLabel="Sign In and Keep Reminders">
             <ShieldCheck size={18} color="#182312" />
-            <Text style={styles.signInDirectBtnText}>Sign In & Keep Reminders</Text>
+            <Text style={styles.signInDirectBtnText}>{signingIn ? 'Please wait?' : emailStep === 'email' ? 'Sign In & Keep Reminders' : 'Verify email'}</Text>
             <ArrowRight size={17} color="#182312" />
           </Pressable>
 
-          {/* Quick 1-tap testing profile */}
           <Pressable
-            onPress={() => {
-              onSignIn({
-                isLoggedIn: true,
-                name: 'Affan Mushtaque',
-                email: 'affan.mushtaque@gmail.com',
-                avatarInitial: 'AM',
-                authProvider: 'google',
-              });
-              onClose();
+            onPress={async () => {
+              try { await onSignIn({ ...DEFAULT_USER }); onClose(); }
+              catch { Alert.alert('Could not continue', 'Please try again.'); }
             }}
             style={styles.signInQuickTestBtn}
-            accessibilityLabel="Quick test with Affan Mushtaque"
+            accessibilityLabel="Continue as guest"
           >
             <View style={styles.signInQuickTestIcon}><Sparkles size={14} color={C.lime} /></View>
             <View style={{ flex: 1 }}>
-              <Text style={styles.signInQuickTestTitle}>Quick 1-Tap Test Account</Text>
-              <Text style={styles.signInQuickTestSub}>Affan Mushtaque (affan.mushtaque@gmail.com)</Text>
+              <Text style={styles.signInQuickTestTitle}>Continue as guest</Text>
+              <Text style={styles.signInQuickTestSub}>Keep reminders on this device</Text>
             </View>
             <ArrowRight size={15} color={C.lime} />
           </Pressable>
@@ -2985,7 +3081,7 @@ function AccountProfileSheet({
 
       <View style={styles.sheetHeader}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.sheetEyebrow}>ACCOUNT & SYNC</Text>
+          <Text style={styles.sheetEyebrow}>ACCOUNT & PROFILE</Text>
           <Text style={styles.detailsTitle}>Remindly Profile</Text>
         </View>
         <Pressable onPress={onClose} style={styles.sheetClose} accessibilityLabel="Close account sheet">
@@ -3002,17 +3098,14 @@ function AccountProfileSheet({
           <Text style={styles.accountEmail}>{user?.email || 'local@device'}</Text>
           <View style={styles.accountBadge}>
             <ShieldCheck size={12} color={C.lime} />
-            <Text style={styles.accountBadgeText}>{user?.authProvider === 'google' ? 'Google Account Connected' : 'Local-first Guest Mode'}</Text>
+            <Text style={styles.accountBadgeText}>{user?.authProvider === 'google' ? 'Google Account Connected' : user?.isLoggedIn ? 'Email Account Connected' : 'Local-first Guest Mode'}</Text>
           </View>
         </View>
       </View>
 
       <View style={styles.accountActionsList}>
         <Pressable
-          onPress={() => {
-            onClose();
-            onConnectGoogle?.();
-          }}
+          onPress={onConnectGoogle}
           style={styles.accountActionItem}
         >
           <View style={[styles.accountActionIcon, { backgroundColor: '#FFFFFF' }]}>
@@ -3020,7 +3113,7 @@ function AccountProfileSheet({
           </View>
           <View style={{ flex: 1 }}>
             <Text style={styles.accountActionTitle}>{user?.isLoggedIn ? 'Switch Account / Connect Google' : 'Sign In with Google or Email'}</Text>
-            <Text style={styles.accountActionSub}>Sync your reminders across devices and keep them safe.</Text>
+            <Text style={styles.accountActionSub}>Keep reminders under your account on this device.</Text>
           </View>
           <ArrowRight size={16} color={C.lime} />
         </Pressable>
@@ -3059,6 +3152,7 @@ function ReminderAlertCard({ task, onClose, onDone, onSnooze, onDetails }: {
 
 function TaskDetailsSheet({
   task,
+  bottomInset,
   blurTarget,
   isEditing = false,
   onToggleEdit,
@@ -3067,10 +3161,12 @@ function TaskDetailsSheet({
   onSnooze,
   onDelete,
   onSaveEdit,
+  onReschedule,
   onOpenSource,
   onOpenProfileSelector,
 }: {
   task: OmniTask;
+  bottomInset: number;
   blurTarget: React.RefObject<any>;
   isEditing?: boolean;
   onToggleEdit?: (editing: boolean) => void;
@@ -3079,6 +3175,7 @@ function TaskDetailsSheet({
   onSnooze: (minutes: number) => void;
   onDelete?: () => void;
   onSaveEdit?: (updatedTask: OmniTask) => void;
+  onReschedule: () => void;
   onOpenSource: () => void;
   onOpenProfileSelector?: (currentProfile: ProfileKey, onSelect: (p: ProfileKey) => void) => void;
 }) {
@@ -3105,7 +3202,7 @@ function TaskDetailsSheet({
 
   return (
     <View style={styles.sheetKeyboardWrap}>
-      <View style={styles.rDetailsSheet}>
+      <View style={[styles.rDetailsSheet, { paddingBottom: Math.max(bottomInset, 20) + 12 }]}>
         <BlurView
           blurTarget={blurTarget}
           intensity={Platform.OS === 'web' ? 48 : 62}
@@ -3185,7 +3282,7 @@ function TaskDetailsSheet({
             <View style={styles.detailsStatusRow}>
               <View style={[styles.statusDot, task.status === 'overdue' && { backgroundColor: C.red }]} />
               <Text style={styles.detailsStatusText}>
-                {task.status === 'overdue' ? 'Overdue · needs attention' : task.status === 'done' ? 'Completed' : 'Scheduled'}
+                {task.status === 'overdue' ? 'Overdue · needs attention' : task.status === 'done' ? 'Completed' : task.status === 'inbox' ? 'Inbox · no deadline' : 'Scheduled'}
               </Text>
               <View style={{ flex: 1 }} />
               {task.important ? (
@@ -3201,16 +3298,16 @@ function TaskDetailsSheet({
             </View>
 
             <View style={styles.detailInfoGrid}>
-              <View style={styles.detailInfoCard}>
+              <Pressable style={styles.detailInfoCard} onPress={onReschedule} accessibilityLabel="Change reminder date">
                 <CalendarDays color={C.lime} size={18} />
                 <Text style={styles.detailInfoLabel}>DATE</Text>
                 <Text style={styles.detailInfoValue}>{task.dateLabel}</Text>
-              </View>
-              <View style={styles.detailInfoCard}>
+              </Pressable>
+              <Pressable style={styles.detailInfoCard} onPress={onReschedule} accessibilityLabel="Change reminder time">
                 <Clock3 color={C.lime} size={18} />
                 <Text style={styles.detailInfoLabel}>TIME</Text>
                 <Text style={styles.detailInfoValue}>{task.timeLabel}</Text>
-              </View>
+              </Pressable>
             </View>
 
             <SectionLabel title="Original context" detail={`Shared from ${task.source}`} />

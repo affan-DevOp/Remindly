@@ -124,6 +124,7 @@ Remindly/
 ### Prerequisites
 
 - **Node.js**: 18.x or newer (tested on Node 20 & 24)
+- **Full test suite**: use Node 24; the native database migration tests use its built-in SQLite engine to enforce real foreign-key constraints.
 - **npm** or **yarn**
 - **Android Device or Emulator** (API 26+) / **Expo Go**
 

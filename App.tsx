@@ -3,6 +3,7 @@ import { AppState, View, Text, Pressable, StyleSheet, ActivityIndicator } from '
 import { useFonts, PlusJakartaSans_600SemiBold, PlusJakartaSans_700Bold } from '@expo-google-fonts/plus-jakarta-sans';
 import { Inter_400Regular, Inter_500Medium, Inter_600SemiBold } from '@expo-google-fonts/inter';
 import { JetBrainsMono_500Medium, JetBrainsMono_600SemiBold } from '@expo-google-fonts/jetbrains-mono';
+import { loadAsync as loadFontsAsync } from 'expo-font';
 import { StatusBar } from 'expo-status-bar';
 import * as WebBrowser from 'expo-web-browser';
 import { ClerkProvider, useUser, useClerk } from '@clerk/clerk-expo';
@@ -24,7 +25,7 @@ Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
     shouldShowList: true,
-    shouldPlaySound: true,
+    shouldPlaySound: (await taskRepository.getSettings()).notificationsSoundEnabled !== false,
     shouldSetBadge: false,
   }),
 });
@@ -99,13 +100,23 @@ function MainApplication() {
           setSharedTitle(sharePayload.suggestedTitle);
           setShareRevision((revision) => revision + 1);
         }
+        const initialUrl = await Linking.getInitialURL();
+        if (initialUrl && mounted) {
+          const taskId = Linking.parse(initialUrl).queryParams?.taskId;
+          if (typeof taskId === 'string') {
+            setNotificationTaskId(taskId);
+            setNotificationRevision((revision) => revision + 1);
+          }
+        }
       } catch (err) {
         console.warn('[Remindly] Bootstrap primary error:', err);
         try {
           console.warn('[Remindly] Recovering using fallback storage...');
           await taskRepository.initFallback();
           const fallbackSettings = await taskRepository.getSettings();
-          const fallbackTasks = await taskRepository.getAllTasks('local_guest');
+          const fallbackUserId = fallbackSettings.user.isLoggedIn ? (fallbackSettings.user.email || 'local_guest') : 'local_guest';
+          taskRepository.setCurrentUserId(fallbackUserId);
+          const fallbackTasks = await taskRepository.getAllTasks(fallbackUserId);
           if (mounted) {
             setUser(fallbackSettings.user);
             setSettings(fallbackSettings);
@@ -132,6 +143,11 @@ function MainApplication() {
     const sub = Linking.addEventListener('url', ({ url }) => {
       try {
         const parsed = Linking.parse(url);
+        if (typeof parsed.queryParams?.taskId === 'string') {
+          setNotificationTaskId(parsed.queryParams.taskId);
+          setNotificationRevision((revision) => revision + 1);
+          return;
+        }
         if (parsed.queryParams?.text || parsed.queryParams?.title || parsed.queryParams?.url || parsed.queryParams?.subject || parsed.queryParams?.package || parsed.queryParams?.caller) {
           const text = String(parsed.queryParams.text || parsed.queryParams.title || '');
           const linkUrl = parsed.queryParams.url ? String(parsed.queryParams.url) : undefined;
@@ -170,7 +186,10 @@ function MainApplication() {
       if (allowed) await notificationService.reconcileNotifications();
     };
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') void refreshPermissionAndSchedules();
+      if (state === 'active') {
+        void refreshPermissionAndSchedules().catch((error) => console.warn('[Remindly] Could not refresh reminders:', error));
+        void taskRepository.getAllTasks(taskRepository.getCurrentUserId()).then(setTasks).catch((error) => console.warn('[Remindly] Could not refresh tasks:', error));
+      }
     });
     return () => {
       active = false;
@@ -277,7 +296,6 @@ function MainApplication() {
 
   // 3b. Restore Task (Undo) Callback
   const handleTaskRestored = useCallback(async (task: OmniTask) => {
-    task.status = 'upcoming';
     const activeUserId = user.isLoggedIn ? (user.email || 'local_guest') : 'local_guest';
     task.userId = activeUserId;
     await taskRepository.saveTask(task, activeUserId);
@@ -324,6 +342,7 @@ function MainApplication() {
   const handleNotificationsVibrationChange = useCallback(async (enabled: boolean) => {
     await taskRepository.updateSetting('notifications_vibration_enabled', enabled);
     setSettings((current) => ({ ...current, notificationsVibrationEnabled: enabled }));
+    await notificationService.reconcileNotifications();
   }, []);
 
   const handlePersistentFollowupsChange = useCallback(async (enabled: boolean) => {
@@ -364,8 +383,12 @@ function MainApplication() {
   }, []);
 
   const handleDateOnlyTimeChange = useCallback(async (time: string) => {
-    await taskRepository.updateSetting('default_date_only_time', time);
-    setSettings((current) => ({ ...current, dateOnlyTime: time }));
+    const match = time.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+    if (!match) throw new Error('Invalid default time');
+    const hour = Number(match[1]) % 12 + (match[3]?.toUpperCase() === 'PM' ? 12 : match[3] ? 0 : Number(match[1]) >= 12 ? 12 : 0);
+    const canonical = `${String(hour).padStart(2, '0')}:${match[2]}`;
+    await taskRepository.updateSetting('default_date_only_time', canonical);
+    setSettings((current) => ({ ...current, dateOnlyTime: canonical }));
   }, []);
 
   // 6. Test Notification Trigger
@@ -378,7 +401,7 @@ function MainApplication() {
 
   // Sync Clerk Google User if authenticated
   useEffect(() => {
-    if (clerkLoaded && clerkSignedIn && clerkUser) {
+    if (!loading && clerkLoaded && clerkSignedIn && clerkUser) {
       const name = clerkUser.fullName || clerkUser.firstName || clerkUser.username || 'Google User';
       const email = clerkUser.primaryEmailAddress?.emailAddress || '';
       const initials = name
@@ -394,7 +417,7 @@ function MainApplication() {
         name,
         email,
         avatarInitial: initials,
-        authProvider: 'google',
+        authProvider: clerkUser.externalAccounts.some((account) => account.provider === 'google') ? 'google' : 'email',
       };
 
       taskRepository.saveUser(syncedUser).then(async () => {
@@ -403,9 +426,9 @@ function MainApplication() {
         setInitialView('app');
         const userTasks = await taskRepository.getAllTasks(syncedUser.email);
         setTasks(userTasks);
-      });
+      }).catch((error) => console.warn('[Remindly] Could not load signed-in profile:', error));
     }
-  }, [clerkLoaded, clerkSignedIn, clerkUser]);
+  }, [loading, clerkLoaded, clerkSignedIn, clerkUser]);
 
   // 7. User Authentication Handlers (Google Sign In & Logout with Multi-User Isolation)
   const handleUserLogin = useCallback(async (newUser: UserProfile) => {
@@ -423,9 +446,7 @@ function MainApplication() {
       if (clerkSignedIn) {
         await clerk.signOut();
       }
-    } catch (e) {
-      console.warn('[Remindly] Clerk signout warning:', e);
-    }
+    } catch (e) { throw e; }
     await taskRepository.logoutUser();
     taskRepository.setCurrentUserId('local_guest');
     setUser(DEFAULT_USER);
@@ -454,7 +475,7 @@ function MainApplication() {
               setBootstrapError(undefined);
               taskRepository.initFallback().then(() => {
                 setRetryVersion((v) => v + 1);
-              });
+              }).catch((error) => { setBootstrapError(String(error)); setLoading(false); });
             }}
             style={[styles.retryButton, { backgroundColor: '#38BDF8' }]}
           >
@@ -493,6 +514,14 @@ function MainApplication() {
       notificationsAllowed={notificationsAllowed}
       onUserLogin={handleUserLogin}
       onUserLogout={handleUserLogout}
+      onOnboardingDismissed={async () => {
+        await taskRepository.updateSetting('has_seen_onboarding', true);
+        setInitialView('app');
+      }}
+      onQuickCaptureAnywhereChange={async (enabled) => {
+        await taskRepository.updateSetting('quick_capture_anywhere_enabled', enabled);
+        setSettings((current) => ({ ...current, quickCaptureAnywhereEnabled: enabled }));
+      }}
       onCaptureSaved={handleCaptureSaved}
       onTaskCompleted={handleTaskCompleted}
       onTaskArchived={handleTaskArchived}
@@ -518,7 +547,7 @@ function MainApplication() {
 }
 
 export default function App() {
-  const [fontsLoaded] = useFonts({
+  const appFonts = {
     PlusJakartaSans_600SemiBold,
     PlusJakartaSans_700Bold,
     Inter_400Regular,
@@ -526,9 +555,33 @@ export default function App() {
     Inter_600SemiBold,
     JetBrainsMono_500Medium,
     JetBrainsMono_600SemiBold,
-  });
+  };
+  const [fontsLoaded, fontsError] = useFonts(appFonts);
+  const [fontsRecovered, setFontsRecovered] = useState(false);
+  const [retryingFonts, setRetryingFonts] = useState(false);
+  const [fontRetryError, setFontRetryError] = useState<string>();
+  useEffect(() => {
+    if (fontsError) console.warn('[Remindly] Could not load fonts:', fontsError.message);
+  }, [fontsError]);
 
-  if (!fontsLoaded) {
+  if (fontsError && !fontsRecovered) {
+    return (
+      <View style={styles.errorContainer}>
+        <Text style={styles.errorTitle}>Could not load app fonts</Text>
+        <Text style={styles.errorMessage}>{fontRetryError || 'Please check the connection and try again.'}</Text>
+        <Pressable disabled={retryingFonts} style={styles.retryButton} onPress={async () => {
+          setRetryingFonts(true);
+          try { await loadFontsAsync(appFonts); setFontsRecovered(true); }
+          catch (error) { setFontRetryError(error instanceof Error ? error.message : String(error)); }
+          finally { setRetryingFonts(false); }
+        }}>
+          <Text style={styles.retryButtonText}>{retryingFonts ? 'Retrying…' : 'Retry'}</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  if (!fontsLoaded && !fontsRecovered) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color={C.lime} />

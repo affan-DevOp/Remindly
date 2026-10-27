@@ -166,7 +166,7 @@ describe('Phase 3 — Reminder Domain Engine & Android Notification Scheduling',
       await notificationService.handleNotificationResponse(mockResponse as any, now);
       const updated = await taskRepository.getDomainTask('snooze-action-task');
       expect(updated?.status).toBe('scheduled');
-      expect(updated?.due_local_time).toBe('In 15 min');
+      expect(updated?.due_local_time).toBe('10:00');
     });
 
     test('Sends test diagnostic notification successfully', async () => {

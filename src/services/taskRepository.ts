@@ -144,12 +144,14 @@ export class TaskRepository {
       this.initialized = true;
 
       try {
-        const countRow = await this.db.getFirst<{ count: number }>("SELECT COUNT(*) as count FROM tasks WHERE user_id = 'local_guest';");
-        if (!countRow || countRow.count === 0) {
+        const seeded = await this.db.getFirst<AppSettingRecord>('SELECT * FROM app_settings WHERE key = ?;', ['seed_tasks_initialized']);
+        const countRow = await this.db.getFirst<{ count: number }>('SELECT COUNT(*) as count FROM tasks;');
+        if (!seeded && (!countRow || countRow.count === 0)) {
           for (const t of INITIAL_SEED_TASKS) {
             await this.saveOmniTask({ ...t, userId: 'local_guest' }, 'local_guest');
           }
         }
+        await this.updateSetting('seed_tasks_initialized', true);
       } catch (seedErr) {
         console.warn('[TaskRepository] Could not seed default tasks:', seedErr);
       }
@@ -176,12 +178,14 @@ export class TaskRepository {
     this.initialized = true;
 
     try {
-      const countRow = await this.db.getFirst<{ count: number }>("SELECT COUNT(*) as count FROM tasks WHERE user_id = 'local_guest';");
-      if (!countRow || countRow.count === 0) {
+      const seeded = await this.db.getFirst<AppSettingRecord>('SELECT * FROM app_settings WHERE key = ?;', ['seed_tasks_initialized']);
+      const countRow = await this.db.getFirst<{ count: number }>('SELECT COUNT(*) as count FROM tasks;');
+      if (!seeded && (!countRow || countRow.count === 0)) {
         for (const t of INITIAL_SEED_TASKS) {
           await this.saveOmniTask({ ...t, userId: 'local_guest' }, 'local_guest');
         }
       }
+      await this.updateSetting('seed_tasks_initialized', true);
     } catch (e) {}
   }
 
@@ -378,6 +382,8 @@ export class TaskRepository {
       .filter((task) => task.status !== 'archived')
       .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc));
     const sources = await db.getAll<TaskSourceRecord>('SELECT * FROM task_sources;');
+    const snoozes = (await this.getPendingOccurrences()).filter((occurrence) => occurrence.stage_label.startsWith('Snooze'));
+    const snoozeMap = new Map(snoozes.map((occurrence) => [occurrence.task_id, occurrence]));
 
         const sourceMap = new Map<string, TaskSourceRecord>();
     for (const s of sources) {
@@ -415,10 +421,14 @@ export class TaskRepository {
 
       const localDate = t.due_local_date || undefined;
       const localTime = t.due_local_time || undefined;
+      const snooze = snoozeMap.get(t.id);
+      const snoozeMinutes = snooze ? Math.max(1, Math.ceil((Date.parse(snooze.trigger_at_utc) - Date.now()) / 60000)) : 0;
+      if (snooze && t.status === 'scheduled') status = 'upcoming';
       return {
         id: t.id,
+        userId: t.user_id,
         title: t.title,
-        timeLabel: formatTimeLabel(localTime),
+        timeLabel: snooze ? (snoozeMinutes === 60 ? 'In 1 hour' : `In ${snoozeMinutes} min`) : formatTimeLabel(localTime),
         dateLabel: localDate ? formatDateLabel(localDate) : 'Inbox',
         status,
         source: sourceKey,
@@ -578,20 +588,32 @@ export class TaskRepository {
 
   public async snoozeTask(taskId: string, minutes: number = 10, now: Date = new Date()): Promise<void> {
     await this.init();
-    const task = await this.getDomainTask(taskId);
+    let task = await this.getDomainTask(taskId);
     if (!task) return;
 
     // Preserve original deadline (due_at_utc and due_local_date)!
     const snoozeTriggerMs = now.getTime() + minutes * 60 * 1000;
     const snoozeTriggerUtc = new Date(snoozeTriggerMs).toISOString();
-    const timeLabel = minutes === 60 ? 'In 1 hour' : `In ${minutes} min`;
+    if (!Number.isFinite(minutes) || minutes <= 0) throw new Error('Invalid snooze duration');
+    if (task.status === 'archived') throw new Error('Cannot snooze an archived task');
+    if (task.status === 'inbox' || task.status === 'completed') {
+      await this.saveDomainTask({
+        ...task, status: 'scheduled', completed_at_utc: null,
+        due_at_utc: task.due_at_utc || snoozeTriggerUtc,
+        due_local_date: task.due_local_date || formatLocalDate(new Date(snoozeTriggerUtc)),
+        due_local_time: task.due_local_time || formatLocalTime(new Date(snoozeTriggerUtc)),
+        due_precision: task.due_precision === 'none' ? 'datetime' : task.due_precision,
+        updated_at_utc: now.toISOString(),
+      }, null, now);
+      task = (await this.getDomainTask(taskId))!;
+    }
 
     const db = this.getDb();
     await db.transaction(async (tx) => {
-      // 1. Update task timeLabel and updated_at_utc without changing original due_at_utc
+      // Keep the deadline's canonical local time intact when snoozing.
       await tx.run(
         'UPDATE tasks SET due_local_time = ?, updated_at_utc = ? WHERE id = ?;',
-        [timeLabel, now.toISOString(), task.id]
+        [task.due_local_time, now.toISOString(), task.id]
       );
 
       // 2. Cancel previous pending snooze occurrences for this task (avoiding duplicate snooze timers)
@@ -642,7 +664,7 @@ export class TaskRepository {
   public async getSettings(): Promise<AppSettings> {
     await this.init();
     const rows = await this.getDb().getAll<AppSettingRecord>('SELECT * FROM app_settings;');
-    const settings: AppSettings = { ...DEFAULT_SETTINGS };
+    const settings: AppSettings = { ...DEFAULT_SETTINGS, user: { ...DEFAULT_USER } };
 
     for (const r of rows) {
       if (r.key === 'quiet_hours_enabled') settings.quietHoursEnabled = r.value === '1' || r.value === 'true';
@@ -660,6 +682,8 @@ export class TaskRepository {
       if (r.key === 'notifications_vibration_enabled') settings.notificationsVibrationEnabled = r.value === '1' || r.value === 'true';
       if (r.key === 'persistent_followups_enabled') settings.persistentFollowupsEnabled = r.value === '1' || r.value === 'true';
       if (r.key === 'lock_screen_privacy') settings.lockScreenPrivacy = r.value === '1' || r.value === 'true';
+      if (r.key === 'quick_capture_anywhere_enabled') settings.quickCaptureAnywhereEnabled = r.value === '1' || r.value === 'true';
+      if (r.key === 'floating_button_visible') settings.floatingButtonVisible = r.value === '1' || r.value === 'true';
       if (r.key === 'user_is_logged_in') settings.user.isLoggedIn = r.value === '1';
       if (r.key === 'user_name') settings.user.name = r.value;
       if (r.key === 'user_email') settings.user.email = r.value;
@@ -667,9 +691,6 @@ export class TaskRepository {
       if (r.key === 'user_auth_provider') settings.user.authProvider = r.value as any;
     }
 
-    if (settings.user.isLoggedIn && settings.user.email) {
-      this.currentUserId = settings.user.email;
-    }
     return settings;
   }
 
@@ -684,28 +705,22 @@ export class TaskRepository {
 
   public async saveUser(user: UserProfile): Promise<void> {
     await this.init();
-    const targetUserId = user.email || 'local_guest';
+    const targetUserId = user.isLoggedIn ? (user.email || 'local_guest') : 'local_guest';
     this.currentUserId = targetUserId;
     await this.updateSetting('user_is_logged_in', user.isLoggedIn ? '1' : '0');
     await this.updateSetting('user_name', user.name);
     await this.updateSetting('user_email', user.email);
     await this.updateSetting('user_avatar_initial', user.avatarInitial);
     await this.updateSetting('user_auth_provider', user.authProvider);
-    await this.updateSetting('has_seen_onboarding', user.isLoggedIn ? '1' : '0');
+    await this.updateSetting('has_seen_onboarding', '1');
 
     // Multi-user task preservation: if user signs in and has no tasks, migrate guest tasks
     if (user.isLoggedIn && targetUserId !== 'local_guest') {
       try {
-        const existingTargetTasks = await this.getDb().getFirst<{ count: number }>(
-          'SELECT count(*) as count FROM tasks WHERE user_id = ?;',
-          [targetUserId]
+        await this.getDb().run(
+          'UPDATE tasks SET user_id = ? WHERE user_id = ? OR user_id IS NULL;',
+          [targetUserId, 'local_guest']
         );
-        if (!existingTargetTasks || Number(existingTargetTasks.count) === 0) {
-          await this.getDb().run(
-            'UPDATE tasks SET user_id = ? WHERE user_id = ? OR user_id IS NULL;',
-            [targetUserId, 'local_guest']
-          );
-        }
       } catch (err) {
         console.warn('[Remindly] Error migrating guest tasks to user:', err);
       }
